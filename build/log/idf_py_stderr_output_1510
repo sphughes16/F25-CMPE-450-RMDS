@@ -1,0 +1,9 @@
+Command: cmake -G Ninja -B /workspaces/hello_world/build -DPYTHON_DEPS_CHECKED=1 -DPYTHON=/opt/esp/python_env/idf6.1_py3.12_env/bin/python -DESP_PLATFORM=1 -DIDF_TARGET=esp32s3 -DCCACHE_ENABLE=False /workspaces/hello_world
+Configuration Report               
+ ───────────────────────────────── 
+   Parser Version: 1               
+   Verbosity: default              
+   Defaults policy: sdkconfig      
+   Status: Finished successfully   
+                                   
+ ───────────────────────────────── 
