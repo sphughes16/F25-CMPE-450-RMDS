@@ -4,11 +4,12 @@
   "idf.toolsPathWin": "C:\\Users\\venom\\.espressif",
   "idf.pythonInstallPath": "/opt/esp/python_env/idf6.1_py3.12_env/bin/python",
   "idf.openOcdConfigs": [
-    "board/esp32s3-builtin.cfg"
+    "interface/ftdi/esp32_devkitj_v1.cfg",
+    "target/esp32.cfg"
   ],
   "idf.customExtraVars": {
-    "IDF_TARGET": "esp32s3"
+    "IDF_TARGET": "esp32"
   },
   "idf.flashType": "UART",
-  "idf.port": "/dev/ttyS4"
+  "idf.port": "/dev/ttyACM0"
 }
