@@ -8,5 +8,7 @@
   ],
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32s3"
-  }
+  },
+  "idf.flashType": "UART",
+  "idf.port": "/dev/ttyS4"
 }

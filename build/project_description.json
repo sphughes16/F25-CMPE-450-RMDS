@@ -1,7 +1,7 @@
 {
     "version":            "1.2",
     "project_name":       "hello_world",
-    "project_version":    "1",
+    "project_version":    "184dff0-dirty",
     "project_path":       "/workspaces/hello_world",
     "idf_path":           "/opt/esp/idf",
     "build_dir":          "/workspaces/hello_world/build",
