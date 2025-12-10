@@ -1,4 +1,16 @@
+// rmds_lora.h
 #pragma once
 
-// Start the RMDS LoRa node task (TX + RX in one FreeRTOS task)
-void rmds_lora_start(void);
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// Start LoRa in TX-only mode (periodic beacons every 400 ms).
+void rmds_lora_start_tx_only(void);
+
+// Start LoRa in RX-only mode (continuous listen).
+void rmds_lora_start_rx_only(void);
+
+#ifdef __cplusplus
+}
+#endif

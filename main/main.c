@@ -344,25 +344,21 @@ static void rmds_oled_task(void *pvParameters)
 // =========
 void app_main(void)
 {
-    init_i2c_and_oled();
-    ESP_LOGI(TAG, "I2C and OLED initialized");
+void app_main(void)
+{
+    init_i2c_and_oled();      // your existing OLED init
+    xTaskCreate(oled_task,    // whatever you named it
+                "oled_task",
+                4096,
+                NULL,
+                4,
+                NULL);
 
-    // Start LoRa combined TX/RX node task
-    rmds_lora_start();
+    ESP_LOGI("APP", "Starting TX-only node firmware");
+    rmds_lora_start_tx_only();
 
-    // Start OLED animation task
-    BaseType_t ok = xTaskCreate(
-        rmds_oled_task,
-        "rmds_oled_task",
-        4096,      // stack size
-        NULL,
-        4,         // priority (lower than LoRa, or adjust as you wish)
-        NULL
-    );
-    if (ok != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create rmds_oled_task");
-    }
-
-    // app_main runs in its own FreeRTOS task; we're done with it
-    vTaskDelete(NULL);
+    /* UNCOMMENT FOR RX MODE
+    ESP_LOGI("APP", "Starting RX-only node firmware");
+    rmds_lora_start_rx_only();*/
+}
 }
