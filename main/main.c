@@ -339,15 +339,10 @@ static void rmds_oled_task(void *pvParameters)
     }
 }
 
-// =========
-//  app_main
-// =========
-void app_main(void)
-{
 void app_main(void)
 {
     init_i2c_and_oled();      // your existing OLED init
-    xTaskCreate(oled_task,    // whatever you named it
+    xTaskCreate(rmds_oled_task,    // whatever you named it
                 "oled_task",
                 4096,
                 NULL,
@@ -361,4 +356,4 @@ void app_main(void)
     ESP_LOGI("APP", "Starting RX-only node firmware");
     rmds_lora_start_rx_only();*/
 }
-}
+

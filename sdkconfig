@@ -2032,16 +2032,11 @@ CONFIG_SPI_FLASH_ENABLE_ENCRYPTED_READ_WRITE=y
 #
 # LoRa Configuration
 #
-# default:
-CONFIG_CS_GPIO=15
-# default:
-CONFIG_RST_GPIO=32
-# default:
-CONFIG_MISO_GPIO=13
-# default:
-CONFIG_MOSI_GPIO=12
-# default:
-CONFIG_SCK_GPIO=14
+CONFIG_CS_GPIO=18
+CONFIG_RST_GPIO=23
+CONFIG_MISO_GPIO=19
+CONFIG_MOSI_GPIO=27
+CONFIG_SCK_GPIO=5
 # end of LoRa Configuration
 # end of Component config
 
