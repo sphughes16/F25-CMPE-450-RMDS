@@ -235,21 +235,7 @@ CONFIG_SOC_MPU_MIN_REGION_SIZE=0x20000000
 # default:
 CONFIG_SOC_MPU_REGIONS_MAX_NUM=8
 # default:
-CONFIG_SOC_RMT_GROUPS=1
-# default:
-CONFIG_SOC_RMT_TX_CANDIDATES_PER_GROUP=8
-# default:
-CONFIG_SOC_RMT_RX_CANDIDATES_PER_GROUP=8
-# default:
-CONFIG_SOC_RMT_CHANNELS_PER_GROUP=8
-# default:
 CONFIG_SOC_RMT_MEM_WORDS_PER_CHANNEL=64
-# default:
-CONFIG_SOC_RMT_SUPPORT_REF_TICK=y
-# default:
-CONFIG_SOC_RMT_SUPPORT_APB=y
-# default:
-CONFIG_SOC_RMT_CHANNEL_CLK_INDEPENDENT=y
 # default:
 CONFIG_SOC_RTCIO_PIN_COUNT=18
 # default:
@@ -300,12 +286,6 @@ CONFIG_SOC_TOUCH_SAMPLE_CFG_NUM=1
 CONFIG_SOC_TWAI_CONTROLLER_NUM=1
 # default:
 CONFIG_SOC_TWAI_MASK_FILTER_NUM=1
-# default:
-CONFIG_SOC_TWAI_BRP_MIN=2
-# default:
-CONFIG_SOC_TWAI_CLK_SUPPORT_APB=y
-# default:
-CONFIG_SOC_TWAI_SUPPORT_MULTI_ADDRESS_LAYOUT=y
 # default:
 CONFIG_SOC_UART_NUM=3
 # default:
@@ -701,6 +681,11 @@ CONFIG_ESPTOOLPY_AFTER_RESET=y
 CONFIG_ESPTOOLPY_AFTER="hard-reset"
 # default:
 CONFIG_ESPTOOLPY_MONITOR_BAUD=115200
+
+#
+# Fast Reflashing
+#
+# end of Fast Reflashing
 # end of Serial flasher config
 
 #
@@ -1063,6 +1048,8 @@ CONFIG_ESP_INTR_IN_IRAM=y
 #
 # default:
 CONFIG_LIBC_NEWLIB=y
+# default:
+# CONFIG_LIBC_PICOLIBC is not set
 # default:
 CONFIG_LIBC_MISC_IN_IRAM=y
 # default:
@@ -1530,6 +1517,8 @@ CONFIG_LOG_IN_IRAM=y
 #
 # Core Configuration
 #
+# default:
+# CONFIG_MBEDTLS_VER_4_X_SUPPORT is not set
 # default:
 CONFIG_MBEDTLS_COMPILER_OPTIMIZATION_NONE=y
 # default:
@@ -2039,6 +2028,21 @@ CONFIG_SPI_FLASH_SUPPORT_WINBOND_CHIP=y
 # default:
 CONFIG_SPI_FLASH_ENABLE_ENCRYPTED_READ_WRITE=y
 # end of SPI Flash driver
+
+#
+# LoRa Configuration
+#
+# default:
+CONFIG_CS_GPIO=15
+# default:
+CONFIG_RST_GPIO=32
+# default:
+CONFIG_MISO_GPIO=13
+# default:
+CONFIG_MOSI_GPIO=12
+# default:
+CONFIG_SCK_GPIO=14
+# end of LoRa Configuration
 # end of Component config
 
 # default:
