@@ -16,6 +16,8 @@
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_io_i2c.h"
 
+#include "rmds_lora.h"   // <---- NEW: LoRa task interface
+
 #define TAG "RMDS_OLED"
 
 // ================================
@@ -76,7 +78,6 @@ static inline void fb_set_pixel(int x, int y, bool on)
         frame_buffer[byte_index] &= ~bit_mask;
     }
 }
-
 
 static void fb_fill_rect(int x0, int y0, int w, int h, bool on)
 {
@@ -305,13 +306,14 @@ static void draw_rmds_partial(int letters_to_show)
     }
 }
 
-// =========
-//  app_main
-// =========
-void app_main(void)
+// ===========================
+//  OLED animation FreeRTOS task
+// ===========================
+static void rmds_oled_task(void *pvParameters)
 {
-    init_i2c_and_oled();
-    ESP_LOGI(TAG, "I2C and OLED initialized, starting RMDS sign animation");
+    (void)pvParameters;
+
+    ESP_LOGI(TAG, "RMDS OLED task started");
 
     while (1) {
         // Step through R -> RM -> RMD -> RMDS
@@ -335,4 +337,32 @@ void app_main(void)
             vTaskDelay(pdMS_TO_TICKS(HOLD_FULL_DELAY_MS));
         }
     }
+}
+
+// =========
+//  app_main
+// =========
+void app_main(void)
+{
+    init_i2c_and_oled();
+    ESP_LOGI(TAG, "I2C and OLED initialized");
+
+    // Start LoRa combined TX/RX node task
+    rmds_lora_start();
+
+    // Start OLED animation task
+    BaseType_t ok = xTaskCreate(
+        rmds_oled_task,
+        "rmds_oled_task",
+        4096,      // stack size
+        NULL,
+        4,         // priority (lower than LoRa, or adjust as you wish)
+        NULL
+    );
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create rmds_oled_task");
+    }
+
+    // app_main runs in its own FreeRTOS task; we're done with it
+    vTaskDelete(NULL);
 }
