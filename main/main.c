@@ -2,6 +2,8 @@
 #include <string.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <inttypes.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -11,14 +13,16 @@
 
 #include "driver/i2c_master.h"
 #include "driver/gpio.h"
+#include "driver/uart.h"
 
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_io_i2c.h"
 
-#include "rmds_lora.h"   // <---- NEW: LoRa task interface
+#include "rmds_lora.h"   // LoRa task interface
 
-#define TAG "RMDS_OLED"
+#define TAG        "RMDS_OLED"
+#define TAG_UART   "UART_RX"
 
 // ================================
 //  OLED + I2C configuration
@@ -39,6 +43,15 @@
 #define STEP_DELAY_MS          300   // R -> RM -> RMD -> RMDS step delay
 #define HOLD_FULL_COUNT        4     // how many times to flash RMDS
 #define HOLD_FULL_DELAY_MS     400   // delay while holding full RMDS
+
+// ================================
+//  UART configuration (UART1 on GPIO 14/25)
+// ================================
+#define SENSOR_UART_NUM   UART_NUM_1
+#define SENSOR_TX_PIN     GPIO_NUM_14
+#define SENSOR_RX_PIN     GPIO_NUM_25
+#define SENSOR_BAUD_RATE  38400
+#define SENSOR_RX_BUF_SZ  2048
 
 // ===============================
 //  Global handles / framebuffer
@@ -138,12 +151,12 @@ static void init_i2c_and_oled(void)
 
     // --- Create panel I/O over I2C ---
     esp_lcd_panel_io_i2c_config_t io_cfg = {
-        .dev_addr           = OLED_I2C_ADDR,
+        .dev_addr            = OLED_I2C_ADDR,
         .control_phase_bytes = 1,
-        .lcd_cmd_bits       = 8,
-        .lcd_param_bits     = 8,
-        .dc_bit_offset      = 6,
-        .scl_speed_hz       = I2C_MASTER_FREQ_HZ,
+        .lcd_cmd_bits        = 8,
+        .lcd_param_bits      = 8,
+        .dc_bit_offset       = 6,
+        .scl_speed_hz        = I2C_MASTER_FREQ_HZ,
     };
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_i2c(i2c_bus_handle, &io_cfg, &io_handle));
 
@@ -339,21 +352,199 @@ static void rmds_oled_task(void *pvParameters)
     }
 }
 
+// ===========================
+//  UART frame parsing helpers
+// ===========================
+typedef struct {
+    uint32_t start;
+    uint32_t field1;
+    uint32_t magic;
+    uint32_t field2;
+    uint32_t field3;
+    int32_t  field4;   // signed
+    uint32_t end;
+} sensor_frame_t;
+
+static uint32_t parse_hex32(const char *s)
+{
+    // expects a null-terminated string like "0000005b"
+    return (uint32_t)strtoul(s, NULL, 16);
+}
+
+static bool frame_is_valid(const sensor_frame_t *f)
+{
+    return (f->start == 0x0000005B &&
+            f->end   == 0x0000005D &&
+            f->magic == 0xAAAAAA1A);
+}
+
+static void dump_frame(const sensor_frame_t *f)
+{
+    ESP_LOGI(TAG_UART,
+             "Frame: start=0x%08" PRIx32
+             " field1=%" PRIu32
+             " magic=0x%08" PRIx32
+             " field2=%" PRIu32
+             " field3=%" PRIu32
+             " field4=%" PRId32
+             " end=0x%08" PRIx32,
+             f->start,
+             f->field1,
+             f->magic,
+             f->field2,
+             f->field3,
+             f->field4,
+             f->end);
+}
+
+// ===========================
+//  UART RX FreeRTOS task
+// ===========================
+static void uart_rx_task(void *pvParameters)
+{
+    (void)pvParameters;
+
+    ESP_LOGI(TAG_UART, "UART RX task started");
+
+    uint8_t rx_buf[128];
+    char line_buf[16];          // enough for 8 hex chars + '\r' + '\n' + '\0'
+    int line_len = 0;
+
+    uint32_t fields[7];
+    int field_count = 0;
+
+    while (1) {
+        int len = uart_read_bytes(SENSOR_UART_NUM, rx_buf,
+                                  sizeof(rx_buf),
+                                  pdMS_TO_TICKS(1000));
+        if (len <= 0) {
+            continue;
+        }
+
+        for (int i = 0; i < len; ++i) {
+            char c = (char)rx_buf[i];
+
+            if (c == '\r') {
+                continue;  // ignore CR, handle LF
+            }
+
+            if (c == '\n') {
+                if (line_len > 0) {
+                    line_buf[line_len] = '\0';
+
+                    // parse 32-bit value from this line
+                    uint32_t value = parse_hex32(line_buf);
+
+                    if (field_count < 7) {
+                        fields[field_count++] = value;
+                    }
+
+                    // once we have 7 fields, interpret as frame
+                    if (field_count == 7) {
+                        sensor_frame_t f = {
+                            .start  = fields[0],
+                            .field1 = fields[1],
+                            .magic  = fields[2],
+                            .field2 = fields[3],
+                            .field3 = fields[4],
+                            .field4 = (int32_t)fields[5],
+                            .end    = fields[6],
+                        };
+
+                        if (frame_is_valid(&f)) {
+                            dump_frame(&f);
+                        } else {
+                            ESP_LOGW(TAG_UART,
+                                     "Invalid frame: start=0x%08" PRIx32
+                                     " magic=0x%08" PRIx32
+                                     " end=0x%08" PRIx32,
+                                     f.start, f.magic, f.end);
+                        }
+
+                        field_count = 0;
+                    }
+                }
+
+                // reset line buffer after newline
+                line_len = 0;
+            } else {
+                // build current line
+                if (line_len < (int)sizeof(line_buf) - 1) {
+                    line_buf[line_len++] = c;
+                } else {
+                    // overlong line, discard and resync
+                    line_len = 0;
+                }
+            }
+        }
+    }
+}
+
+// ===========================
+//  UART initialization helper
+// ===========================
+static void init_uart_sensor(void)
+{
+    uart_config_t uart_config = {
+        .baud_rate = SENSOR_BAUD_RATE,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_2,     // <-- 2 stop bits
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+
+    ESP_ERROR_CHECK(uart_param_config(SENSOR_UART_NUM, &uart_config));
+    ESP_ERROR_CHECK(uart_set_pin(SENSOR_UART_NUM,
+                                 SENSOR_TX_PIN,
+                                 SENSOR_RX_PIN,
+                                 UART_PIN_NO_CHANGE,
+                                 UART_PIN_NO_CHANGE));
+    ESP_ERROR_CHECK(uart_driver_install(SENSOR_UART_NUM,
+                                        SENSOR_RX_BUF_SZ,
+                                        0,
+                                        0,
+                                        NULL,
+                                        0));
+
+    ESP_LOGI(TAG_UART,
+             "UART%d configured: baud=%d, 8N2, TX=%d, RX=%d",
+             SENSOR_UART_NUM,
+             SENSOR_BAUD_RATE,
+             SENSOR_TX_PIN,
+             SENSOR_RX_PIN);
+}
+
+// =========
+//  app_main
+// =========
 void app_main(void)
 {
-    init_i2c_and_oled();      // your existing OLED init
-    xTaskCreate(rmds_oled_task,    // whatever you named it
+    // OLED init + animation task
+    init_i2c_and_oled();
+    xTaskCreate(rmds_oled_task,
                 "oled_task",
                 4096,
                 NULL,
                 4,
                 NULL);
 
+    // UART init + RX task
+    init_uart_sensor();
+    xTaskCreate(uart_rx_task,
+                "uart_rx_task",
+                4096,
+                NULL,
+                5,
+                NULL);
+
+    /*                
+    // LoRa TX-only node
     ESP_LOGI("APP", "Starting TX-only node firmware");
     rmds_lora_start_tx_only();
-
-    /* UNCOMMENT FOR RX MODE
+        */
+    /* UNCOMMENT FOR RX MODE INSTEAD
     ESP_LOGI("APP", "Starting RX-only node firmware");
-    rmds_lora_start_rx_only();*/
+    rmds_lora_start_rx_only();
+    */
 }
-
