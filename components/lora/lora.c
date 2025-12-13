@@ -7,6 +7,11 @@
 #include "driver/gpio.h"
 #include <string.h>
 
+/* Compatibility shim for different ESP-IDF versions / targets */
+#ifndef VSPI_HOST
+#define VSPI_HOST SPI3_HOST   // On newer IDF, VSPI_HOST is replaced by SPI3_HOST
+#endif
+
 /*
  * Register definitions
  */
