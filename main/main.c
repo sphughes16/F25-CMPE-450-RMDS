@@ -373,21 +373,19 @@ static uint32_t parse_hex32(const char *s)
 
 static bool frame_is_valid(const sensor_frame_t *f)
 {
-    return (f->start == 0x0000005B &&
-            f->end   == 0x0000005D &&
-            f->magic == 0xAAAAAA1A);
+    return (f->start == 0x0000005B && f->end   == 0x0000005D);
 }
 
 static void dump_frame(const sensor_frame_t *f)
 {
     ESP_LOGI(TAG_UART,
-             "Frame: start=0x%08" PRIx32
-             " field1=%" PRIu32
-             " magic=0x%08" PRIx32
-             " field2=%" PRIu32
-             " field3=%" PRIu32
-             " field4=%" PRId32
-             " end=0x%08" PRIx32,
+             "Frame: \n start=0x%08" PRIx32
+             " \n Concentration (PPM)=%" PRIu32
+             " \n Faults (HEX)=0x%08" PRIx32
+             " \n Temperature (K * 10)=%" PRIu32
+             " \n CRC (HEX)=%" PRIu32
+             " \n CRC 1's Comp (HEX)=%" PRId32
+             " \n end=0x%08" PRIx32,
              f->start,
              f->field1,
              f->magic,
@@ -538,11 +536,10 @@ void app_main(void)
                 5,
                 NULL);
 
-    /*                
     // LoRa TX-only node
     ESP_LOGI("APP", "Starting TX-only node firmware");
     rmds_lora_start_tx_only();
-        */
+
     /* UNCOMMENT FOR RX MODE INSTEAD
     ESP_LOGI("APP", "Starting RX-only node firmware");
     rmds_lora_start_rx_only();
