@@ -4,6 +4,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
 #include "esp_log.h"
 
@@ -23,12 +24,11 @@
 #define RMDS_LORA_SYNC_WORD    0x34
 
 // Transmission interval: 400 ms
-// (Actual on-air time of a short LoRa packet is << 400 ms; this keeps us
-// under FCC dwell-time limits per channel.)
 #define RMDS_LORA_TX_PERIOD_MS 400
 
-// Simple fixed node ID for now (you can later take from Kconfig)
-#define RMDS_NODE_ID           1
+// Shared payload buffer (set by UART RX task, used by TX task)
+static char g_lora_payload[RMDS_LORA_PAYLOAD_MAX_LEN];
+static SemaphoreHandle_t g_lora_payload_mutex = NULL;
 
 // ==========================
 //  Common init helper
@@ -75,28 +75,42 @@ static void rmds_lora_tx_task(void *pvParameters)
         return;
     }
 
-    int seq = 0;
+    // Create mutex for the shared payload buffer
+    g_lora_payload_mutex = xSemaphoreCreateMutex();
+    if (g_lora_payload_mutex == NULL) {
+        ESP_LOGE(TAG, "TX task: failed to create payload mutex");
+        vTaskDelete(NULL);
+        return;
+    }
+    g_lora_payload[0] = '\0';  // no payload yet
 
     while (1) {
-        char payload[64];
-        int methane_fake_ppm = 123;  // placeholder for real sensor reading
+        // Copy the latest payload under mutex
+        char payload[RMDS_LORA_PAYLOAD_MAX_LEN];
 
-        int len = snprintf(payload, sizeof(payload),
-                           "NODE=%d,SEQ=%d,METHANE=%d",
-                           RMDS_NODE_ID, seq++, methane_fake_ppm);
-        if (len < 0) len = 0;
-        if (len > (int)sizeof(payload)) len = sizeof(payload);
+        if (g_lora_payload_mutex) {
+            xSemaphoreTake(g_lora_payload_mutex, portMAX_DELAY);
+            strncpy(payload, g_lora_payload, sizeof(payload) - 1);
+            payload[sizeof(payload) - 1] = '\0';
+            xSemaphoreGive(g_lora_payload_mutex);
+        } else {
+            payload[0] = '\0';
+        }
 
-        ESP_LOGI(TAG, "TX: sending packet len=%d", len);
-        ESP_LOGI(TAG, "TX: calling lora_send_packet");
+        int len = (int)strlen(payload);
+        if (len == 0) {
+            ESP_LOGI(TAG, "TX: no sensor payload yet, skipping this period");
+            vTaskDelay(pdMS_TO_TICKS(RMDS_LORA_TX_PERIOD_MS));
+            continue;
+        }
 
-        // NOTE: If this call never returns, the problem is inside the LoRa
-        // library (likely DIO0 / pin config / wiring).
+        ESP_LOGI(TAG,
+                 "TX: sending sensor payload len=%d: \"%.*s\"",
+                 len, len, payload);
+
+        // This call blocks until the packet is transmitted
         lora_send_packet((uint8_t *)payload, len);
-
-        // These prints will only happen if lora_send_packet() returns:
-        printf("[LoRa TX] %.*s\n", len, payload);
-        ESP_LOGI(TAG, "TX: packet sent: %.*s", len, payload);
+        ESP_LOGI(TAG, "TX: packet sent");
 
         vTaskDelay(pdMS_TO_TICKS(RMDS_LORA_TX_PERIOD_MS));
     }
@@ -117,6 +131,19 @@ void rmds_lora_start_tx_only(void)
     if (ok != pdPASS) {
         ESP_LOGE(LORA_TAG, "Failed to create rmds_lora_tx_task");
     }
+}
+
+// Public API called from UART RX task to update the payload
+void rmds_lora_set_payload(const char *payload)
+{
+    if (!payload || !g_lora_payload_mutex) {
+        return;
+    }
+
+    xSemaphoreTake(g_lora_payload_mutex, portMAX_DELAY);
+    strncpy(g_lora_payload, payload, RMDS_LORA_PAYLOAD_MAX_LEN - 1);
+    g_lora_payload[RMDS_LORA_PAYLOAD_MAX_LEN - 1] = '\0';
+    xSemaphoreGive(g_lora_payload_mutex);
 }
 
 // ==========================
@@ -143,8 +170,6 @@ static void rmds_lora_rx_task(void *pvParameters)
     lora_receive();
 
     while (1) {
-        // Most esp32-lora-library examples use lora_received() or directly
-        // lora_receive_packet(). Here we poll in a non-blocking loop.
         int len = lora_receive_packet(buf, sizeof(buf) - 1);
         if (len > 0) {
             buf[len] = '\0';

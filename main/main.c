@@ -355,13 +355,21 @@ static void rmds_oled_task(void *pvParameters)
 // ===========================
 //  UART frame parsing helpers
 // ===========================
+// Frame layout (NORMAL mode):
+//   1) 0x0000005B   (start, '[')
+//   2) concentration (PPM)        - HEX on wire, we show DECIMAL
+//   3) faults                     - HEX on wire, we show DECIMAL
+//   4) sensor temperature (K*10)  - HEX on wire, we show Kelvin = value/10
+//   5) CRC                        - HEX
+//   6) CRC 1's complement         - HEX, crc ^ crc_1c == 0xFFFFFFFF
+//   7) 0x0000005D   (end, ']')
 typedef struct {
     uint32_t start;
-    uint32_t field1;
-    uint32_t magic;
-    uint32_t field2;
-    uint32_t field3;
-    int32_t  field4;   // signed
+    uint32_t conc_ppm;
+    uint32_t faults;
+    uint32_t temp_raw;   // Kelvin * 10
+    uint32_t crc;
+    uint32_t crc_inv;
     uint32_t end;
 } sensor_frame_t;
 
@@ -371,28 +379,57 @@ static uint32_t parse_hex32(const char *s)
     return (uint32_t)strtoul(s, NULL, 16);
 }
 
+static bool frame_crc_ok(const sensor_frame_t *f)
+{
+    return ((f->crc ^ f->crc_inv) == 0xFFFFFFFFu);
+}
+
 static bool frame_is_valid(const sensor_frame_t *f)
 {
-    return (f->start == 0x0000005B && f->end   == 0x0000005D);
+    if (f->start != 0x0000005B || f->end != 0x0000005D) {
+        return false;
+    }
+    if (!frame_crc_ok(f)) {
+        ESP_LOGW(TAG_UART,
+                 "CRC mismatch: crc=0x%08" PRIx32 " inv=0x%08" PRIx32,
+                 f->crc, f->crc_inv);
+        return false;
+    }
+    return true;
 }
 
 static void dump_frame(const sensor_frame_t *f)
 {
+    float temp_K = f->temp_raw / 10.0f;
+
     ESP_LOGI(TAG_UART,
-             "Frame: \n start=0x%08" PRIx32
-             " \n Concentration (PPM)=%" PRIu32
-             " \n Faults (HEX)=0x%08" PRIx32
-             " \n Temperature (K * 10)=%" PRIu32
-             " \n CRC (HEX)=%" PRIu32
-             " \n CRC 1's Comp (HEX)=%" PRId32
-             " \n end=0x%08" PRIx32,
-             f->start,
-             f->field1,
-             f->magic,
-             f->field2,
-             f->field3,
-             f->field4,
-             f->end);
+             "Frame: Conc=%" PRIu32 " ppm, Faults=%" PRIu32
+             ", Temp=%.1f K, CRC=0x%08" PRIx32 ", CRC_1C=0x%08" PRIx32,
+             f->conc_ppm,
+             f->faults,
+             temp_K,
+             f->crc,
+             f->crc_inv);
+}
+
+// Build LoRa text payload from the parsed frame
+static void build_lora_payload_from_frame(const sensor_frame_t *f,
+                                          char *out,
+                                          size_t out_sz)
+{
+    if (!out || out_sz == 0) return;
+
+    float temp_K = f->temp_raw / 10.0f;
+
+    // LoRa payload: all the important fields, compact but human-readable
+    // Example: "C=111ppm,F=0,T=295.1K,CRC=1234ABCD,I=EDCB5432"
+    snprintf(out, out_sz,
+             "C=%" PRIu32 "ppm,F=%" PRIu32 ",T=%.1fK,CRC=%08" PRIx32 ",I=%08" PRIx32,
+             f->conc_ppm,
+             f->faults,
+             temp_K,
+             f->crc,
+             f->crc_inv);
 }
 
 // ===========================
@@ -405,7 +442,7 @@ static void uart_rx_task(void *pvParameters)
     ESP_LOGI(TAG_UART, "UART RX task started");
 
     uint8_t rx_buf[128];
-    char line_buf[16];          // enough for 8 hex chars + '\r' + '\n' + '\0'
+    char line_buf[16];          // enough for 8 hex chars + '\n' + '\0'
     int line_len = 0;
 
     uint32_t fields[7];
@@ -423,40 +460,44 @@ static void uart_rx_task(void *pvParameters)
             char c = (char)rx_buf[i];
 
             if (c == '\r') {
-                continue;  // ignore CR, handle LF
+                continue;  // ignore CR, handle LF only
             }
 
             if (c == '\n') {
                 if (line_len > 0) {
                     line_buf[line_len] = '\0';
 
-                    // parse 32-bit value from this line
                     uint32_t value = parse_hex32(line_buf);
 
                     if (field_count < 7) {
                         fields[field_count++] = value;
                     }
 
-                    // once we have 7 fields, interpret as frame
+                    // once we have 7 fields, interpret as a frame
                     if (field_count == 7) {
                         sensor_frame_t f = {
-                            .start  = fields[0],
-                            .field1 = fields[1],
-                            .magic  = fields[2],
-                            .field2 = fields[3],
-                            .field3 = fields[4],
-                            .field4 = (int32_t)fields[5],
-                            .end    = fields[6],
+                            .start    = fields[0],
+                            .conc_ppm = fields[1],
+                            .faults   = fields[2],
+                            .temp_raw = fields[3],
+                            .crc      = fields[4],
+                            .crc_inv  = fields[5],
+                            .end      = fields[6],
                         };
 
                         if (frame_is_valid(&f)) {
                             dump_frame(&f);
+
+                            // Build LoRa payload & hand it off to LoRa TX task
+                            char payload[RMDS_LORA_PAYLOAD_MAX_LEN];
+                            build_lora_payload_from_frame(&f, payload, sizeof(payload));
+                            rmds_lora_set_payload(payload);
+                            ESP_LOGI(TAG_UART, "Updated LoRa payload: %s", payload);
                         } else {
                             ESP_LOGW(TAG_UART,
                                      "Invalid frame: start=0x%08" PRIx32
-                                     " magic=0x%08" PRIx32
                                      " end=0x%08" PRIx32,
-                                     f.start, f.magic, f.end);
+                                     f.start, f.end);
                         }
 
                         field_count = 0;
@@ -487,7 +528,7 @@ static void init_uart_sensor(void)
         .baud_rate = SENSOR_BAUD_RATE,
         .data_bits = UART_DATA_8_BITS,
         .parity    = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_2,     // <-- 2 stop bits
+        .stop_bits = UART_STOP_BITS_2,     // 2 stop bits
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
         .source_clk = UART_SCLK_DEFAULT,
     };
@@ -536,11 +577,11 @@ void app_main(void)
                 5,
                 NULL);
 
-    // LoRa TX-only node
+    // LoRa TX-only node (now sends *sensor* payload)
     ESP_LOGI("APP", "Starting TX-only node firmware");
     rmds_lora_start_tx_only();
 
-    /* UNCOMMENT FOR RX MODE INSTEAD
+    /* If you ever want RX-only:
     ESP_LOGI("APP", "Starting RX-only node firmware");
     rmds_lora_start_rx_only();
     */
