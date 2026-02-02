@@ -20,13 +20,12 @@
 #include "esp_lcd_io_i2c.h"
 
 #include "rmds_lora.h"   // LoRa task interface
+#include "rmds_wifi.h"   // WiFi/cloud interface (used on RX node)
 
 #define TAG        "RMDS_OLED"
 #define TAG_UART   "UART_RX"
 
-// ================================
 //  OLED + I2C configuration
-// ================================
 #define I2C_MASTER_SCL_IO      22
 #define I2C_MASTER_SDA_IO      21
 #define I2C_MASTER_PORT        I2C_NUM_0
@@ -40,22 +39,18 @@
 #define OLED_HEIGHT            64
 
 // Animation timing (ms)
-#define STEP_DELAY_MS          300   // R -> RM -> RMD -> RMDS step delay
-#define HOLD_FULL_COUNT        4     // how many times to flash RMDS
-#define HOLD_FULL_DELAY_MS     400   // delay while holding full RMDS
+#define STEP_DELAY_MS          300
+#define HOLD_FULL_COUNT        4
+#define HOLD_FULL_DELAY_MS     400
 
-// ================================
-//  UART configuration (UART1 on GPIO 14/25)
-// ================================
+//  UART configuration (UART1 on GPIO 14/25) TX node
 #define SENSOR_UART_NUM   UART_NUM_1
 #define SENSOR_TX_PIN     GPIO_NUM_14
 #define SENSOR_RX_PIN     GPIO_NUM_25
 #define SENSOR_BAUD_RATE  38400
 #define SENSOR_RX_BUF_SZ  2048
 
-// ===============================
 //  Global handles / framebuffer
-// ===============================
 static i2c_master_bus_handle_t  i2c_bus_handle = NULL;
 static i2c_master_dev_handle_t  i2c_dev_handle = NULL;
 static esp_lcd_panel_io_handle_t io_handle    = NULL;
@@ -64,9 +59,7 @@ static esp_lcd_panel_handle_t    panel_handle = NULL;
 // 1-bpp framebuffer: 8 vertical pixels per byte
 static uint8_t frame_buffer[OLED_WIDTH * OLED_HEIGHT / 8];
 
-// ==================================
 //  Framebuffer helper implementations
-// ==================================
 static inline void fb_clear(void)
 {
     memset(frame_buffer, 0x00, sizeof(frame_buffer));
@@ -78,7 +71,7 @@ static inline void fb_set_pixel(int x, int y, bool on)
         return;
     }
 
-    // Rotate 180°: logical (0,0) -> physical (WIDTH-1, HEIGHT-1)
+    // Rotate 180: physical (WIDTH-1, HEIGHT-1)
     int hw_x = (OLED_WIDTH  - 1) - x;
     int hw_y = (OLED_HEIGHT - 1) - y;
 
@@ -123,9 +116,7 @@ static void fb_flush_to_panel(void)
                               frame_buffer);
 }
 
-// ===========================
 //  I2C & OLED initialization
-// ===========================
 static void init_i2c_and_oled(void)
 {
     // --- I2C bus config ---
@@ -174,10 +165,6 @@ static void init_i2c_and_oled(void)
 
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
 }
-
-// =======================
-//  Simple block letters
-// =======================
 
 // Block-style R
 static void draw_letter_R(int x0, int y0, int w, int h)
@@ -280,11 +267,6 @@ static void draw_letter_S(int x0, int y0, int w, int h)
                  w - stroke, stroke, true);
 }
 
-// ===============================
-//  RMDS logo drawing / animation
-// ===============================
-
-// Draw 1–4 letters of "RMDS"
 static void draw_rmds_partial(int letters_to_show)
 {
     fb_clear();
@@ -319,9 +301,6 @@ static void draw_rmds_partial(int letters_to_show)
     }
 }
 
-// ===========================
-//  OLED animation FreeRTOS task
-// ===========================
 static void rmds_oled_task(void *pvParameters)
 {
     (void)pvParameters;
@@ -352,9 +331,8 @@ static void rmds_oled_task(void *pvParameters)
     }
 }
 
-// ===========================
-//  UART frame parsing helpers
-// ===========================
+//  UART frame
+//
 // Frame layout (NORMAL mode):
 //   1) 0x0000005B   (start, '[')
 //   2) concentration (PPM)        - HEX on wire, we show DECIMAL
@@ -363,6 +341,7 @@ static void rmds_oled_task(void *pvParameters)
 //   5) CRC                        - HEX
 //   6) CRC 1's complement         - HEX, crc ^ crc_1c == 0xFFFFFFFF
 //   7) 0x0000005D   (end, ']')
+
 typedef struct {
     uint32_t start;
     uint32_t conc_ppm;
@@ -375,7 +354,6 @@ typedef struct {
 
 static uint32_t parse_hex32(const char *s)
 {
-    // expects a null-terminated string like "0000005b"
     return (uint32_t)strtoul(s, NULL, 16);
 }
 
@@ -386,9 +364,9 @@ static bool frame_crc_ok(const sensor_frame_t *f)
 
 static bool frame_is_valid(const sensor_frame_t *f)
 {
-    if (f->start != 0x0000005B || f->end != 0x0000005D) {
+    /*if (f->start != 0x0000005B || f->end != 0x0000005D) {
         return false;
-    }
+    }*/
     if (!frame_crc_ok(f)) {
         ESP_LOGW(TAG_UART,
                  "CRC mismatch: crc=0x%08" PRIx32 " inv=0x%08" PRIx32,
@@ -397,7 +375,6 @@ static bool frame_is_valid(const sensor_frame_t *f)
     }
     return true;
 }
-
 static void dump_frame(const sensor_frame_t *f)
 {
     float temp_K = f->temp_raw / 10.0f;
@@ -412,29 +389,30 @@ static void dump_frame(const sensor_frame_t *f)
              f->crc_inv);
 }
 
-// Build LoRa text payload from the parsed frame
-static void build_lora_payload_from_frame(const sensor_frame_t *f,
-                                          char *out,
-                                          size_t out_sz)
+static void build_lora_payload_from_frame(const sensor_frame_t *f, char *out, size_t out_sz)
 {
     if (!out || out_sz == 0) return;
 
     float temp_K = f->temp_raw / 10.0f;
 
-    // LoRa payload: all the important fields, compact but human-readable
-    // Example: "C=111ppm,F=0,T=295.1K,CRC=1234ABCD,I=EDCB5432"
-    snprintf(out, out_sz,
-             "C=%" PRIu32 "ppm,F=%" PRIu32 ",T=%.1fK,CRC=%08" PRIx32 ",I=%08" PRIx32,
-             f->conc_ppm,
-             f->faults,
-             temp_K,
-             f->crc,
-             f->crc_inv);
-}
+    // Example: "C=370ppm,F=2863311386,T=301.0K,CRC=000003b3,CRC_1C=fffffc4c"
+    int n = snprintf(out, out_sz,
+                     "Concentration=%" PRIu32 "ppm, "
+                     "Faults=%" PRIu32 ", "
+                     "Sensor Temp=%.1fK, "
+                     "CRC=%08" PRIx32 ", "
+                     "CRC_1C=%08" PRIx32,
+                     f->conc_ppm,
+                     f->faults,
+                     temp_K,
+                     f->crc,
+                     f->crc_inv);
 
-// ===========================
-//  UART RX FreeRTOS task
-// ===========================
+    if (n < 0 || (size_t)n >= out_sz) {
+        ESP_LOGW(TAG_UART, "LoRa payload truncated (size=%zu)", out_sz);
+    }
+}
+//  UART RX FreeRTOS task (TX node)
 static void uart_rx_task(void *pvParameters)
 {
     (void)pvParameters;
@@ -442,7 +420,7 @@ static void uart_rx_task(void *pvParameters)
     ESP_LOGI(TAG_UART, "UART RX task started");
 
     uint8_t rx_buf[128];
-    char line_buf[16];          // enough for 8 hex chars + '\n' + '\0'
+    char line_buf[16];          // 8 hex chars + LF + NUL
     int line_len = 0;
 
     uint32_t fields[7];
@@ -473,7 +451,6 @@ static void uart_rx_task(void *pvParameters)
                         fields[field_count++] = value;
                     }
 
-                    // once we have 7 fields, interpret as a frame
                     if (field_count == 7) {
                         sensor_frame_t f = {
                             .start    = fields[0],
@@ -488,7 +465,6 @@ static void uart_rx_task(void *pvParameters)
                         if (frame_is_valid(&f)) {
                             dump_frame(&f);
 
-                            // Build LoRa payload & hand it off to LoRa TX task
                             char payload[RMDS_LORA_PAYLOAD_MAX_LEN];
                             build_lora_payload_from_frame(&f, payload, sizeof(payload));
                             rmds_lora_set_payload(payload);
@@ -519,9 +495,7 @@ static void uart_rx_task(void *pvParameters)
     }
 }
 
-// ===========================
-//  UART initialization helper
-// ===========================
+//  UART initialization helper (TX node)
 static void init_uart_sensor(void)
 {
     uart_config_t uart_config = {
@@ -554,12 +528,9 @@ static void init_uart_sensor(void)
              SENSOR_RX_PIN);
 }
 
-// =========
-//  app_main
-// =========
 void app_main(void)
 {
-    // OLED init + animation task
+    // OLED init + animation task (optional on RX node, but fine on both)
     init_i2c_and_oled();
     xTaskCreate(rmds_oled_task,
                 "oled_task",
@@ -568,7 +539,7 @@ void app_main(void)
                 4,
                 NULL);
 
-    // UART init + RX task
+    //USE FOR TX NODE
     init_uart_sensor();
     xTaskCreate(uart_rx_task,
                 "uart_rx_task",
@@ -577,12 +548,12 @@ void app_main(void)
                 5,
                 NULL);
 
-    // LoRa TX-only node (now sends *sensor* payload)
     ESP_LOGI("APP", "Starting TX-only node firmware");
     rmds_lora_start_tx_only();
 
-    /* If you ever want RX-only:
-    ESP_LOGI("APP", "Starting RX-only node firmware");
-    rmds_lora_start_rx_only();
-    */
+    // USE FOR RX NODE
+    //
+    // rmds_wifi_init();          // connect to Wi-Fi, only uncomment this line if master node
+    // ESP_LOGI("APP", "Starting RX-only node firmware");
+    // rmds_lora_start_rx_only(); // LoRa RX + cloud forwarding is in rmds_lora.c
 }

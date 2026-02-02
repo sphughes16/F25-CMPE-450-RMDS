@@ -11,9 +11,7 @@
 #include "lora.h"
 #include "rmds_lora.h"
 
-// ==========================
 //  LoRa configuration
-// ==========================
 #define LORA_TAG               "RMDS_LORA"
 
 #define RMDS_LORA_FREQ_HZ      915000000L   // 915 MHz (US ISM band)
@@ -30,9 +28,10 @@
 static char g_lora_payload[RMDS_LORA_PAYLOAD_MAX_LEN];
 static SemaphoreHandle_t g_lora_payload_mutex = NULL;
 
-// ==========================
+// Packet sequence counter (increments for each LoRa packet sent)
+static uint32_t g_lora_seq = 0;
+
 //  Common init helper
-// ==========================
 static bool rmds_lora_common_init(const char *tag)
 {
     ESP_LOGI(tag, "LoRa init: calling lora_init()");
@@ -58,9 +57,7 @@ static bool rmds_lora_common_init(const char *tag)
     return true;
 }
 
-// ==========================
 //  TX-only task
-// ==========================
 static void rmds_lora_tx_task(void *pvParameters)
 {
     (void)pvParameters;
@@ -75,13 +72,16 @@ static void rmds_lora_tx_task(void *pvParameters)
         return;
     }
 
-    // Create mutex for the shared payload buffer
-    g_lora_payload_mutex = xSemaphoreCreateMutex();
+    // Create mutex for the shared payload buffer (if not already created)
     if (g_lora_payload_mutex == NULL) {
-        ESP_LOGE(TAG, "TX task: failed to create payload mutex");
-        vTaskDelete(NULL);
-        return;
+        g_lora_payload_mutex = xSemaphoreCreateMutex();
+        if (g_lora_payload_mutex == NULL) {
+            ESP_LOGE(TAG, "TX task: failed to create payload mutex");
+            vTaskDelete(NULL);
+            return;
+        }
     }
+
     g_lora_payload[0] = '\0';  // no payload yet
 
     while (1) {
@@ -97,20 +97,42 @@ static void rmds_lora_tx_task(void *pvParameters)
             payload[0] = '\0';
         }
 
-        int len = (int)strlen(payload);
-        if (len == 0) {
+        int base_len = (int)strlen(payload);
+        if (base_len == 0) {
             ESP_LOGI(TAG, "TX: no sensor payload yet, skipping this period");
             vTaskDelay(pdMS_TO_TICKS(RMDS_LORA_TX_PERIOD_MS));
             continue;
         }
 
+        // Build final TX packet with sequence prefix: "SEQ=N,<payload>"
+        char tx_buf[RMDS_LORA_PAYLOAD_MAX_LEN + 32];
+        int tx_len = snprintf(tx_buf, sizeof(tx_buf),
+                              "SEQ=%u,%s",
+                              (unsigned int)g_lora_seq,
+                              payload);
+
+        if (tx_len < 0) {
+            tx_len = 0;
+        } else if (tx_len >= (int)sizeof(tx_buf)) {
+            // Truncate safely if needed
+            tx_len = (int)sizeof(tx_buf) - 1;
+            tx_buf[tx_len] = '\0';
+            ESP_LOGW(TAG, "TX: payload truncated to %d bytes", tx_len);
+        }
+
         ESP_LOGI(TAG,
-                 "TX: sending sensor payload len=%d: \"%.*s\"",
-                 len, len, payload);
+                 "TX: sending sensor payload seq=%u len=%d: \"%.*s\"",
+                 (unsigned int)g_lora_seq,
+                 tx_len,
+                 tx_len,
+                 tx_buf);
 
         // This call blocks until the packet is transmitted
-        lora_send_packet((uint8_t *)payload, len);
-        ESP_LOGI(TAG, "TX: packet sent");
+        lora_send_packet((uint8_t *)tx_buf, tx_len);
+        ESP_LOGI(TAG, "TX: packet sent (SEQ=%u)", (unsigned int)g_lora_seq);
+
+        // Increment sequence for next packet
+        g_lora_seq++;
 
         vTaskDelay(pdMS_TO_TICKS(RMDS_LORA_TX_PERIOD_MS));
     }
@@ -137,6 +159,7 @@ void rmds_lora_start_tx_only(void)
 void rmds_lora_set_payload(const char *payload)
 {
     if (!payload || !g_lora_payload_mutex) {
+        // If mutex isn't ready yet, just drop this update.
         return;
     }
 
@@ -146,9 +169,7 @@ void rmds_lora_set_payload(const char *payload)
     xSemaphoreGive(g_lora_payload_mutex);
 }
 
-// ==========================
 //  RX-only task
-// ==========================
 static void rmds_lora_rx_task(void *pvParameters)
 {
     (void)pvParameters;
