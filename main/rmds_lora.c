@@ -14,7 +14,7 @@
 //  LoRa configuration
 #define LORA_TAG               "RMDS_LORA"
 
-#define RMDS_LORA_FREQ_HZ      915000000L   // 915 MHz (US ISM band)
+#define RMDS_LORA_FREQ_HZ      915000000L   // 915 MHz
 #define RMDS_LORA_BW_HZ        125000L      // 125 kHz bandwidth
 #define RMDS_LORA_SF           7            // spreading factor
 #define RMDS_LORA_CR           5            // coding rate 4/5

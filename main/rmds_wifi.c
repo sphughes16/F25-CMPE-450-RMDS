@@ -18,7 +18,7 @@
 
 #define WIFI_TAG "RMDS_WIFI"
 
-// ***** EDIT THESE FOR YOUR SETUP *****
+// Will need to be changed!
 #define RMDS_WIFI_SSID     "UMBC Visitor"
 #define RMDS_WIFI_PASS     ""
 
@@ -37,9 +37,7 @@ static EventGroupHandle_t s_wifi_event_group;
 static int s_retry_num = 0;
 static const int MAX_RETRY = 5;
 
-// --------------------
 // Wi-Fi event handler
-// --------------------
 static void wifi_event_handler(void *arg,
                                esp_event_base_t event_base,
                                int32_t event_id,
@@ -65,14 +63,12 @@ static void wifi_event_handler(void *arg,
     }
 }
 
-// --------------------
 // Wi-Fi init / connect
-// --------------------
 void rmds_wifi_init(void)
 {
     esp_err_t ret;
 
-    // Initialize NVS (required for Wi-Fi)
+    // Initialize NVS
     ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
         ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -137,14 +133,12 @@ void rmds_wifi_init(void)
     }
 }
 
-// ---------------------
 // HTTP POST helper
-// ---------------------
 static esp_err_t _http_event_handler(esp_http_client_event_t *evt)
 {
     switch (evt->event_id) {
     case HTTP_EVENT_ON_DATA:
-        // You could print response here if you care
+        //Connection succeeded, we got a response (if any) from the server
         break;
     default:
         break;
@@ -152,9 +146,7 @@ static esp_err_t _http_event_handler(esp_http_client_event_t *evt)
     return ESP_OK;
 }
 
-// ---------------------
 // Public cloud API
-// ---------------------
 void send_frame_to_cloud(const char *payload)
 {
     if (!payload || payload[0] == '\0') {
@@ -163,8 +155,6 @@ void send_frame_to_cloud(const char *payload)
     }
 
     // Build a small JSON body wrapping the LoRa payload
-    // NOTE: If your payload can contain quotes or special chars,
-    // you'd want to escape them properly.
     char json_body[512];
     int written = snprintf(json_body, sizeof(json_body),
                            "{\"raw\":\"%s\"}", payload);

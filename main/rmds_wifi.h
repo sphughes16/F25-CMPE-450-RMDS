@@ -13,7 +13,6 @@ void rmds_wifi_init(void);
 
 /**
  * Send a single LoRa payload up to the cloud backend.
- * `payload` is a null-terminated string (what you received over LoRa).
  */
 void send_frame_to_cloud(const char *payload);
 

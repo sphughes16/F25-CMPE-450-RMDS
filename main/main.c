@@ -33,7 +33,7 @@
 #define I2C_MASTER_CLK_SOURCE  I2C_CLK_SRC_DEFAULT
 #define I2C_MASTER_FREQ_HZ     400000
 
-// SSD1306 I2C address (commonly 0x3C)
+// SSD1306 I2C address
 #define OLED_I2C_ADDR          0x3C
 #define OLED_WIDTH             128
 #define OLED_HEIGHT            64
@@ -322,7 +322,7 @@ static void rmds_oled_task(void *pvParameters)
             fb_flush_to_panel();
             vTaskDelay(pdMS_TO_TICKS(HOLD_FULL_DELAY_MS));
 
-            // Optional blink-off effect
+            // Blink-off effect
             fb_clear();
             fb_draw_border();
             fb_flush_to_panel();
@@ -331,7 +331,7 @@ static void rmds_oled_task(void *pvParameters)
     }
 }
 
-//  UART frame
+//  typedef struct to hold UART frame
 //
 // Frame layout (NORMAL mode):
 //   1) 0x0000005B   (start, '[')
@@ -375,6 +375,7 @@ static bool frame_is_valid(const sensor_frame_t *f)
     }
     return true;
 }
+
 static void dump_frame(const sensor_frame_t *f)
 {
     float temp_K = f->temp_raw / 10.0f;
@@ -395,7 +396,6 @@ static void build_lora_payload_from_frame(const sensor_frame_t *f, char *out, si
 
     float temp_K = f->temp_raw / 10.0f;
 
-    // Example: "C=370ppm,F=2863311386,T=301.0K,CRC=000003b3,CRC_1C=fffffc4c"
     int n = snprintf(out, out_sz,
                      "Concentration=%" PRIu32 "ppm, "
                      "Faults=%" PRIu32 ", "
@@ -530,7 +530,7 @@ static void init_uart_sensor(void)
 
 void app_main(void)
 {
-    // OLED init + animation task (optional on RX node, but fine on both)
+    // OLED init + animation task (optional on RX node, but fine if left in)
     init_i2c_and_oled();
     xTaskCreate(rmds_oled_task,
                 "oled_task",
