@@ -1,4 +1,3 @@
-
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_bt.h"
@@ -85,4 +84,3 @@ void check_wake_reason(void)
             break;
     }
 }
-

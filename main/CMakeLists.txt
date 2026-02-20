@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "main.c" "rmds_lora.c"
+    SRCS "rmds_wifi.c" "main.c" "rmds_lora.c" "power.c"
     PRIV_REQUIRES
         spi_flash
         esp_driver_i2c
