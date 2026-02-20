@@ -19,6 +19,8 @@
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_io_i2c.h"
 
+#include "power.h"
+
 #include "rmds_lora.h"   // LoRa task interface
 #include "rmds_wifi.h"   // WiFi/cloud interface (used on RX node)
 
@@ -357,6 +359,7 @@ static uint32_t parse_hex32(const char *s)
     return (uint32_t)strtoul(s, NULL, 16);
 }
 
+//Validates the CRC Check
 static bool frame_crc_ok(const sensor_frame_t *f)
 {
     return ((f->crc ^ f->crc_inv) == 0xFFFFFFFFu);
@@ -530,6 +533,7 @@ static void init_uart_sensor(void)
 
 void app_main(void)
 {
+    check_wake_reason();
     // OLED init + animation task (optional on RX node, but fine if left in)
     init_i2c_and_oled();
     xTaskCreate(rmds_oled_task,
@@ -550,6 +554,8 @@ void app_main(void)
 
     ESP_LOGI("APP", "Starting TX-only node firmware");
     rmds_lora_start_tx_only();
+
+    enter_modem_sleep();
 
     // USE FOR RX NODE
     //
