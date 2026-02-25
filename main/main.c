@@ -556,6 +556,7 @@ void app_main(void)
     rmds_lora_start_tx_only();
 
     enter_modem_sleep();
+    enter_deep_sleep(10); 
 
     // USE FOR RX NODE
     //

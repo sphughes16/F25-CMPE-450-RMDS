@@ -1,6 +1,5 @@
 #include "esp_log.h"
 #include "esp_wifi.h"
-#include "esp_bt.h"
 #include "esp_sleep.h"
 #include "esp_pm.h"
 
@@ -20,8 +19,6 @@ void enter_modem_sleep(void)
     // Turn off WiFi and Bluetooth
     esp_wifi_stop();
     esp_wifi_deinit();
-    esp_bt_controller_disable();
-    esp_bt_controller_deinit();
     
     // Set CPU to 80 MHz
     esp_pm_config_esp32_t pm_config = {
