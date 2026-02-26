@@ -22,12 +22,12 @@
 #define RMDS_WIFI_SSID     "UMBC Visitor"
 #define RMDS_WIFI_PASS     ""
 
-// Your backend / API endpoint that talks to MongoDB Atlas
-// (for testing you can point this at a mock HTTP server)
+// Backend / API endpoint that talks to MongoDB Atlas
+// (for testing point this at a mock HTTP server)
 #define RMDS_CLOUD_URL     "https://your-backend.example.com/api/sensor"
 
 // Optional API key header for your backend (leave empty if not used)
-#define RMDS_CLOUD_API_KEY ""  // e.g. "my-secret-key"
+#define RMDS_CLOUD_API_KEY ""  
 
 // Event bits
 #define WIFI_CONNECTED_BIT BIT0

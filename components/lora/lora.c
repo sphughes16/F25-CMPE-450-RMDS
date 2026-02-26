@@ -375,7 +375,7 @@ lora_init(void)
    lora_sleep();
    lora_write_reg(REG_FIFO_RX_BASE_ADDR, 0);
    lora_write_reg(REG_FIFO_TX_BASE_ADDR, 0);
-   lora_write_reg(REG_LNA, lora_read_reg(REG_LNA) | 0x03);
+   lora_write_reg(REG_LNA, lora_read_reg(REG_LNA) | 0x03); //Modify hex value to 0xC3 for RX Node
    lora_write_reg(REG_MODEM_CONFIG_3, 0x04);
    lora_set_tx_power(17);
 
