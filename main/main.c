@@ -20,6 +20,7 @@
 #include "esp_lcd_io_i2c.h"
 
 #include "power.h"
+#include "esp_sleep.h"
 
 #include "rmds_lora.h"   // LoRa task interface
 #include "rmds_wifi.h"   // WiFi/cloud interface (used on RX node)
@@ -534,15 +535,7 @@ static void init_uart_sensor(void)
 void app_main(void)
 {
     check_wake_reason();
-    // OLED init + animation task (optional on RX node, but fine if left in)
-    init_i2c_and_oled();
-    xTaskCreate(rmds_oled_task,
-                "oled_task",
-                4096,
-                NULL,
-                4,
-                NULL);
-
+    
     //USE FOR TX NODE
     init_uart_sensor();
     xTaskCreate(uart_rx_task,

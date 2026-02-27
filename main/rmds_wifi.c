@@ -18,16 +18,13 @@
 
 #define WIFI_TAG "RMDS_WIFI"
 
-// Will need to be changed!
+// Wi-Fi credentials
 #define RMDS_WIFI_SSID     "UMBC Visitor"
 #define RMDS_WIFI_PASS     ""
 
-// Backend / API endpoint that talks to MongoDB Atlas
-// (for testing point this at a mock HTTP server)
-#define RMDS_CLOUD_URL     "https://your-backend.example.com/api/sensor"
-
-// Optional API key header for your backend (leave empty if not used)
-#define RMDS_CLOUD_API_KEY ""  
+// MongoDB Atlas Data API endpoint
+#define RMDS_CLOUD_URL     "https://data.mongodb-api.com/app/<APP_ID>/endpoint/data/v1/action/insertOne"
+#define RMDS_CLOUD_API_KEY "<YOUR_DATA_API_KEY>"
 
 // Event bits
 #define WIFI_CONNECTED_BIT BIT0
@@ -107,7 +104,7 @@ void rmds_wifi_init(void)
     snprintf((char *)wifi_config.sta.password,
              sizeof(wifi_config.sta.password), "%s", RMDS_WIFI_PASS);
 
-    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    wifi_config.sta.threshold.authmode = WIFI_AUTH_OPEN;
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
@@ -133,12 +130,12 @@ void rmds_wifi_init(void)
     }
 }
 
-// HTTP POST helper
+// HTTP event handler
 static esp_err_t _http_event_handler(esp_http_client_event_t *evt)
 {
     switch (evt->event_id) {
     case HTTP_EVENT_ON_DATA:
-        //Connection succeeded, we got a response (if any) from the server
+        // Response from server (if needed)
         break;
     default:
         break;
@@ -146,7 +143,7 @@ static esp_err_t _http_event_handler(esp_http_client_event_t *evt)
     return ESP_OK;
 }
 
-// Public cloud API
+// Send data to MongoDB Atlas via Data API
 void send_frame_to_cloud(const char *payload)
 {
     if (!payload || payload[0] == '\0') {
@@ -154,10 +151,16 @@ void send_frame_to_cloud(const char *payload)
         return;
     }
 
-    // Build a small JSON body wrapping the LoRa payload
+    // Build JSON body for MongoDB Data API
     char json_body[512];
     int written = snprintf(json_body, sizeof(json_body),
-                           "{\"raw\":\"%s\"}", payload);
+                           "{"
+                           "\"collection\":\"myCollection\","
+                           "\"database\":\"class_project_db\","
+                           "\"dataSource\":\"Cluster0\","
+                           "\"document\":{\"raw\":\"%s\"}"
+                           "}",
+                           payload);
     if (written <= 0 || written >= (int)sizeof(json_body)) {
         ESP_LOGE(WIFI_TAG, "JSON body too long or error");
         return;
@@ -171,20 +174,19 @@ void send_frame_to_cloud(const char *payload)
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (client == NULL) {
+    if (!client) {
         ESP_LOGE(WIFI_TAG, "Failed to init HTTP client");
         return;
     }
 
     esp_http_client_set_header(client, "Content-Type", "application/json");
-
     if (strlen(RMDS_CLOUD_API_KEY) > 0) {
-        esp_http_client_set_header(client, "X-API-Key", RMDS_CLOUD_API_KEY);
+        esp_http_client_set_header(client, "api-key", RMDS_CLOUD_API_KEY);
     }
 
     esp_http_client_set_post_field(client, json_body, strlen(json_body));
 
-    ESP_LOGI(WIFI_TAG, "Sending payload to cloud: %s", json_body);
+    ESP_LOGI(WIFI_TAG, "Sending payload to MongoDB Atlas: %s", json_body);
 
     esp_err_t err = esp_http_client_perform(client);
     if (err == ESP_OK) {
