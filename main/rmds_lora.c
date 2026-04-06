@@ -10,6 +10,7 @@
 
 #include "lora.h"
 #include "rmds_lora.h"
+#include "rmds_wifi.h"  // for send_frame_to_cloud()
 
 //  LoRa configuration
 #define LORA_TAG               "RMDS_LORA"
@@ -194,6 +195,7 @@ static void rmds_lora_rx_task(void *pvParameters)
         int len = lora_receive_packet(buf, sizeof(buf) - 1);
         if (len > 0) {
             buf[len] = '\0';
+            send_frame_to_cloud((char*)buf);  // send received payload to cloud backend
             printf("[LoRa RX] %s\n", (char *)buf);
             ESP_LOGI(TAG, "RX: got packet len=%d payload=\"%s\"", len, buf);
 
@@ -211,7 +213,7 @@ void rmds_lora_start_rx_only(void)
     BaseType_t ok = xTaskCreate(
         rmds_lora_rx_task,
         "rmds_lora_rx_task",
-        4096,
+        10240,
         NULL,
         5,
         NULL

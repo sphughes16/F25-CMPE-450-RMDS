@@ -3,9 +3,7 @@ idf_component_register(
     REQUIRES
         spi_flash
         esp_wifi
-        esp_driver_i2c
         esp_http_client
-        esp_lcd
         nvs_flash
         esp_driver_gpio
         esp_driver_uart
