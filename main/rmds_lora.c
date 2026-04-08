@@ -1,225 +1,181 @@
-#include <stdio.h>
+#include "rmds_lora.h"
+
 #include <string.h>
-#include <stdint.h>
 
 #include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 #include "freertos/semphr.h"
 
 #include "esp_log.h"
 
 #include "lora.h"
-#include "rmds_lora.h"
-#include "rmds_wifi.h"  // for send_frame_to_cloud()
 
-//  LoRa configuration
-#define LORA_TAG               "RMDS_LORA"
+#define LORA_TAG "RMDS_LORA"
 
-#define RMDS_LORA_FREQ_HZ      915000000L   // 915 MHz
-#define RMDS_LORA_BW_HZ        125000L      // 125 kHz bandwidth
-#define RMDS_LORA_SF           7            // spreading factor
-#define RMDS_LORA_CR           5            // coding rate 4/5
-#define RMDS_LORA_PREAMBLE_LEN 8
-#define RMDS_LORA_SYNC_WORD    0x34
+static const rmds_lora_config_t s_default_config = {
+    .frequency_hz = 915000000L,
+    .bandwidth_hz = 125000L,
+    .spreading_factor = 7,
+    .coding_rate = 5,
+    .preamble_len = 8,
+    .sync_word = 0x34,
+    .enable_crc = true,
+};
 
-// Transmission interval: 400 ms
-#define RMDS_LORA_TX_PERIOD_MS 400
+static SemaphoreHandle_t s_lora_mutex = NULL;
+static bool s_lora_initialized = false;
 
-// Shared payload buffer (set by UART RX task, used by TX task)
-static char g_lora_payload[RMDS_LORA_PAYLOAD_MAX_LEN];
-static SemaphoreHandle_t g_lora_payload_mutex = NULL;
-
-// Packet sequence counter (increments for each LoRa packet sent)
-static uint32_t g_lora_seq = 0;
-
-//  Common init helper
-static bool rmds_lora_common_init(const char *tag)
+static bool rmds_lora_ensure_mutex(void)
 {
-    ESP_LOGI(tag, "LoRa init: calling lora_init()");
-    if (!lora_init()) {
-        ESP_LOGE(tag, "lora_init() failed");
+    if (s_lora_mutex != NULL) {
+        return true;
+    }
+
+    s_lora_mutex = xSemaphoreCreateMutex();
+    if (s_lora_mutex == NULL) {
+        ESP_LOGE(LORA_TAG, "Failed to create LoRa mutex");
         return false;
     }
 
-    lora_set_frequency(RMDS_LORA_FREQ_HZ);
-    lora_set_bandwidth(RMDS_LORA_BW_HZ);
-    lora_set_spreading_factor(RMDS_LORA_SF);
-    lora_set_coding_rate(RMDS_LORA_CR);
-    lora_set_preamble_length(RMDS_LORA_PREAMBLE_LEN);
-    lora_set_sync_word(RMDS_LORA_SYNC_WORD);
-    lora_enable_crc();
-
-    ESP_LOGI(tag,
-             "LoRa configured: freq=%ld Hz, BW=%ld Hz, SF=%d, CR=4/%d",
-             (long)RMDS_LORA_FREQ_HZ,
-             (long)RMDS_LORA_BW_HZ,
-             RMDS_LORA_SF,
-             RMDS_LORA_CR);
     return true;
 }
 
-//  TX-only task
-static void rmds_lora_tx_task(void *pvParameters)
+const rmds_lora_config_t *rmds_lora_default_config(void)
 {
-    (void)pvParameters;
-    const char *TAG = LORA_TAG;
-
-    esp_log_level_set(TAG, ESP_LOG_INFO);
-    ESP_LOGI(TAG, "TX task starting");
-
-    if (!rmds_lora_common_init(TAG)) {
-        ESP_LOGE(TAG, "TX task: init failed, deleting task");
-        vTaskDelete(NULL);
-        return;
-    }
-
-    // Create mutex for the shared payload buffer (if not already created)
-    if (g_lora_payload_mutex == NULL) {
-        g_lora_payload_mutex = xSemaphoreCreateMutex();
-        if (g_lora_payload_mutex == NULL) {
-            ESP_LOGE(TAG, "TX task: failed to create payload mutex");
-            vTaskDelete(NULL);
-            return;
-        }
-    }
-
-    g_lora_payload[0] = '\0';  // no payload yet
-
-    while (1) {
-        // Copy the latest payload under mutex
-        char payload[RMDS_LORA_PAYLOAD_MAX_LEN];
-
-        if (g_lora_payload_mutex) {
-            xSemaphoreTake(g_lora_payload_mutex, portMAX_DELAY);
-            strncpy(payload, g_lora_payload, sizeof(payload) - 1);
-            payload[sizeof(payload) - 1] = '\0';
-            xSemaphoreGive(g_lora_payload_mutex);
-        } else {
-            payload[0] = '\0';
-        }
-
-        int base_len = (int)strlen(payload);
-        if (base_len == 0) {
-            ESP_LOGI(TAG, "TX: no sensor payload yet, skipping this period");
-            vTaskDelay(pdMS_TO_TICKS(RMDS_LORA_TX_PERIOD_MS));
-            continue;
-        }
-
-        // Build final TX packet with sequence prefix: "SEQ=N,<payload>"
-        char tx_buf[RMDS_LORA_PAYLOAD_MAX_LEN + 32];
-        int tx_len = snprintf(tx_buf, sizeof(tx_buf),
-                              "SEQ=%u,%s",
-                              (unsigned int)g_lora_seq,
-                              payload);
-
-        if (tx_len < 0) {
-            tx_len = 0;
-        } else if (tx_len >= (int)sizeof(tx_buf)) {
-            // Truncate safely if needed
-            tx_len = (int)sizeof(tx_buf) - 1;
-            tx_buf[tx_len] = '\0';
-            ESP_LOGW(TAG, "TX: payload truncated to %d bytes", tx_len);
-        }
-
-        ESP_LOGI(TAG,
-                 "TX: sending sensor payload seq=%u len=%d: \"%.*s\"",
-                 (unsigned int)g_lora_seq,
-                 tx_len,
-                 tx_len,
-                 tx_buf);
-
-        // This call blocks until the packet is transmitted
-        lora_send_packet((uint8_t *)tx_buf, tx_len);
-        ESP_LOGI(TAG, "TX: packet sent (SEQ=%u)", (unsigned int)g_lora_seq);
-
-        // Increment sequence for next packet
-        g_lora_seq++;
-
-        vTaskDelay(pdMS_TO_TICKS(RMDS_LORA_TX_PERIOD_MS));
-    }
+    return &s_default_config;
 }
 
-// Public API to start TX-only behavior
-void rmds_lora_start_tx_only(void)
+bool rmds_lora_init(const rmds_lora_config_t *config)
 {
-    BaseType_t ok = xTaskCreate(
-        rmds_lora_tx_task,
-        "rmds_lora_tx_task",
-        4096,
-        NULL,
-        5,
-        NULL
-    );
+    const rmds_lora_config_t *effective_config =
+        (config != NULL) ? config : &s_default_config;
 
-    if (ok != pdPASS) {
-        ESP_LOGE(LORA_TAG, "Failed to create rmds_lora_tx_task");
-    }
-}
-
-// Public API called from UART RX task to update the payload
-void rmds_lora_set_payload(const char *payload)
-{
-    if (!payload || !g_lora_payload_mutex) {
-        // If mutex isn't ready yet, just drop this update.
-        return;
+    if (!rmds_lora_ensure_mutex()) {
+        return false;
     }
 
-    xSemaphoreTake(g_lora_payload_mutex, portMAX_DELAY);
-    strncpy(g_lora_payload, payload, RMDS_LORA_PAYLOAD_MAX_LEN - 1);
-    g_lora_payload[RMDS_LORA_PAYLOAD_MAX_LEN - 1] = '\0';
-    xSemaphoreGive(g_lora_payload_mutex);
-}
+    xSemaphoreTake(s_lora_mutex, portMAX_DELAY);
 
-//  RX-only task
-static void rmds_lora_rx_task(void *pvParameters)
-{
-    (void)pvParameters;
-    const char *TAG = LORA_TAG;
-
-    esp_log_level_set(TAG, ESP_LOG_INFO);
-    ESP_LOGI(TAG, "RX task starting");
-
-    if (!rmds_lora_common_init(TAG)) {
-        ESP_LOGE(TAG, "RX task: init failed, deleting task");
-        vTaskDelete(NULL);
-        return;
+    if (s_lora_initialized) {
+        xSemaphoreGive(s_lora_mutex);
+        return true;
     }
 
-    uint8_t buf[256];
+    ESP_LOGI(LORA_TAG, "Initializing LoRa radio");
+    if (!lora_init()) {
+        xSemaphoreGive(s_lora_mutex);
+        ESP_LOGE(LORA_TAG, "lora_init() failed");
+        return false;
+    }
 
-    // Put radio into continuous receive mode
-    ESP_LOGI(TAG, "RX: entering continuous receive mode");
+    lora_set_frequency(effective_config->frequency_hz);
+    lora_set_bandwidth(effective_config->bandwidth_hz);
+    lora_set_spreading_factor(effective_config->spreading_factor);
+    lora_set_coding_rate(effective_config->coding_rate);
+    lora_set_preamble_length(effective_config->preamble_len);
+    lora_set_sync_word(effective_config->sync_word);
+
+    if (effective_config->enable_crc) {
+        lora_enable_crc();
+    } else {
+        lora_disable_crc();
+    }
+
     lora_receive();
+    s_lora_initialized = true;
+    xSemaphoreGive(s_lora_mutex);
 
-    while (1) {
-        int len = lora_receive_packet(buf, sizeof(buf) - 1);
-        if (len > 0) {
-            buf[len] = '\0';
-            send_frame_to_cloud((char*)buf);  // send received payload to cloud backend
-            printf("[LoRa RX] %s\n", (char *)buf);
-            ESP_LOGI(TAG, "RX: got packet len=%d payload=\"%s\"", len, buf);
-
-            // Resume continuous receive
-            lora_receive();
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(10));  // small delay to avoid hogging CPU
-    }
+    ESP_LOGI(LORA_TAG,
+             "LoRa configured: freq=%ld Hz BW=%ld Hz SF=%d CR=4/%d sync=0x%02x",
+             effective_config->frequency_hz,
+             effective_config->bandwidth_hz,
+             effective_config->spreading_factor,
+             effective_config->coding_rate,
+             effective_config->sync_word);
+    return true;
 }
 
-// Public API to start RX-only behavior
-void rmds_lora_start_rx_only(void)
+bool rmds_lora_send(const void *data, size_t len)
 {
-    BaseType_t ok = xTaskCreate(
-        rmds_lora_rx_task,
-        "rmds_lora_rx_task",
-        10240,
-        NULL,
-        5,
-        NULL
-    );
-
-    if (ok != pdPASS) {
-        ESP_LOGE(LORA_TAG, "Failed to create rmds_lora_rx_task");
+    if (!s_lora_initialized || data == NULL || len == 0 || len > RMDS_LORA_MAX_PACKET_LEN) {
+        return false;
     }
+
+    xSemaphoreTake(s_lora_mutex, portMAX_DELAY);
+    lora_send_packet((uint8_t *)data, (int)len);
+    lora_receive();
+    xSemaphoreGive(s_lora_mutex);
+    return true;
+}
+
+int rmds_lora_receive(uint8_t *buf, size_t buf_len)
+{
+    int len = 0;
+
+    if (!s_lora_initialized || buf == NULL || buf_len == 0) {
+        return 0;
+    }
+
+    xSemaphoreTake(s_lora_mutex, portMAX_DELAY);
+    len = lora_receive_packet(buf, (int)buf_len);
+    if (len > 0) {
+        lora_receive();
+    }
+    xSemaphoreGive(s_lora_mutex);
+
+    return len;
+}
+
+void rmds_lora_start_listening(void)
+{
+    if (!s_lora_initialized) {
+        return;
+    }
+
+    xSemaphoreTake(s_lora_mutex, portMAX_DELAY);
+    lora_receive();
+    xSemaphoreGive(s_lora_mutex);
+}
+
+void rmds_lora_sleep_radio(void)
+{
+    if (!s_lora_initialized) {
+        return;
+    }
+
+    xSemaphoreTake(s_lora_mutex, portMAX_DELAY);
+    lora_sleep();
+    xSemaphoreGive(s_lora_mutex);
+}
+
+bool rmds_lora_is_initialized(void)
+{
+    return s_lora_initialized;
+}
+
+int rmds_lora_last_packet_rssi(void)
+{
+    int rssi = 0;
+
+    if (!s_lora_initialized) {
+        return 0;
+    }
+
+    xSemaphoreTake(s_lora_mutex, portMAX_DELAY);
+    rssi = lora_packet_rssi();
+    xSemaphoreGive(s_lora_mutex);
+    return rssi;
+}
+
+float rmds_lora_last_packet_snr(void)
+{
+    float snr = 0.0f;
+
+    if (!s_lora_initialized) {
+        return 0.0f;
+    }
+
+    xSemaphoreTake(s_lora_mutex, portMAX_DELAY);
+    snr = lora_packet_snr();
+    xSemaphoreGive(s_lora_mutex);
+    return snr;
 }
