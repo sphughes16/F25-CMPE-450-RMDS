@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "rmds_wifi.c" "main.c" "rmds_lora.c" "rmds_network.c" "power.c"
+    SRCS "rocket.c" "rmds_wifi.c" "main.c" "rmds_lora.c" "rmds_network.c" "power.c"
     REQUIRES
         spi_flash
         esp_wifi

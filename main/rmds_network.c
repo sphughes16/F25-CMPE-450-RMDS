@@ -3,6 +3,7 @@
 #include <inttypes.h>
 #include <stddef.h>
 #include <string.h>
+#include <stdbool.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -19,41 +20,60 @@
 
 #define NETWORK_TAG "RMDS_NET"
 
-#define RMDS_NETWORK_PROTOCOL_VERSION 1U
-#define RMDS_NETWORK_BROADCAST_NODE   0xFFU
-#define RMDS_NETWORK_TASK_STACK       8192
-#define RMDS_NETWORK_MAX_TRACKED_RX   16
-#define RMDS_NETWORK_POLL_MS          10
-#define RMDS_NETWORK_GUARD_MS         50
-#define RMDS_NETWORK_ACK_SPACING_MS   75
-#define RMDS_NETWORK_ACK_TURN_MS      40
+#define RMDS_NETWORK_PROTOCOL_VERSION      2U
+#define RMDS_NETWORK_BROADCAST_NODE        0xFFU
+#define RMDS_NETWORK_TASK_STACK            8192
+#define RMDS_NETWORK_POLL_MS               10
+
+#define RMDS_NETWORK_MAX_SEEN_PACKETS      32
+#define RMDS_NETWORK_MAX_HOPS              8
+#define RMDS_NETWORK_BEACON_INTERVAL_MS    4000
+#define RMDS_NETWORK_ROUTE_STALE_MS        15000
+#define RMDS_NETWORK_FORWARD_DELAY_MS      25
+#define RMDS_NETWORK_SEND_INTERVAL_MS      5000
+
+/*
+ * IMPORTANT:
+ * This file assumes your header supports two roles:
+ *
+ *   RMDS_NETWORK_ROLE_GATEWAY
+ *   RMDS_NETWORK_ROLE_MESH_NODE
+ *
+ * and that config has:
+ *
+ *   role
+ *   node_id
+ *   gateway_node_id
+ *   sleep_duration_s   (optional, not used here)
+ *
+ * If your current header still uses MASTER/SENSOR, update it first.
+ */
 
 typedef enum {
-    RMDS_NETWORK_PKT_SYNC = 1,
-    RMDS_NETWORK_PKT_DATA = 2,
-    RMDS_NETWORK_PKT_ACK = 3,
+    RMDS_NETWORK_PKT_BEACON = 1,
+    RMDS_NETWORK_PKT_DATA   = 2,
+    RMDS_NETWORK_PKT_ACK    = 3,
 } rmds_network_packet_type_t;
 
 typedef struct __attribute__((packed)) {
     uint8_t version;
     uint8_t type;
-    uint8_t src_node_id;
-    uint8_t dest_node_id;
-    uint32_t cycle_id;
+    uint8_t origin_node_id;   /* who originally created this packet */
+    uint8_t sender_node_id;   /* who transmitted this copy */
+    uint8_t dest_node_id;     /* next hop or broadcast */
+    uint8_t gateway_node_id;  /* final sink */
+    uint8_t hop_count;
+    uint8_t max_hops;
+    uint32_t sequence;
 } rmds_network_header_t;
 
 typedef struct __attribute__((packed)) {
     rmds_network_header_t header;
-    uint16_t ms_until_primary_window;
-    uint16_t ms_until_ack_window;
-    uint16_t ms_until_retry_window;
-    uint16_t ms_until_sleep_prep;
-    uint16_t cycle_period_ms;
-} rmds_network_sync_packet_t;
+    uint8_t route_cost;       /* cost to gateway; gateway advertises 0 */
+} rmds_network_beacon_packet_t;
 
 typedef struct __attribute__((packed)) {
     rmds_network_header_t header;
-    uint32_t sequence;
     uint32_t concentration_ppm;
     uint32_t faults;
     uint32_t temp_deci_kelvin;
@@ -63,27 +83,24 @@ typedef struct __attribute__((packed)) {
 
 typedef struct __attribute__((packed)) {
     rmds_network_header_t header;
-    uint32_t sequence;
 } rmds_network_ack_packet_t;
 
 typedef struct {
-    int64_t primary_open_ms;
-    int64_t ack_open_ms;
-    int64_t retry_open_ms;
-    int64_t sleep_prep_ms;
-    uint32_t cycle_id;
-    bool synced;
-} rmds_network_sensor_schedule_t;
+    bool valid;
+    uint8_t parent_node_id;
+    uint8_t route_cost;
+    int rssi_dbm;
+    int64_t last_update_ms;
+} rmds_network_route_t;
 
 typedef struct {
     bool used;
-    bool ack_sent;
-    uint8_t node_id;
+    uint8_t origin_node_id;
     uint32_t sequence;
-    rmds_wifi_cloud_frame_t cloud_frame;
-} rmds_network_rx_record_t;
+    int64_t seen_at_ms;
+} rmds_network_seen_packet_t;
 
-_Static_assert(sizeof(rmds_network_sync_packet_t) <= RMDS_LORA_MAX_PACKET_LEN, "sync packet too large");
+_Static_assert(sizeof(rmds_network_beacon_packet_t) <= RMDS_LORA_MAX_PACKET_LEN, "beacon packet too large");
 _Static_assert(sizeof(rmds_network_data_packet_t) <= RMDS_LORA_MAX_PACKET_LEN, "data packet too large");
 _Static_assert(sizeof(rmds_network_ack_packet_t) <= RMDS_LORA_MAX_PACKET_LEN, "ack packet too large");
 
@@ -92,8 +109,10 @@ static rmds_network_sensor_sample_t s_latest_sample;
 static bool s_network_started = false;
 static rmds_network_config_t s_network_config;
 
+static rmds_network_route_t s_route;
+static rmds_network_seen_packet_t s_seen[RMDS_NETWORK_MAX_SEEN_PACKETS];
+
 RTC_DATA_ATTR static uint32_t s_next_sequence = 1;
-RTC_DATA_ATTR static uint32_t s_fallback_cycle_id = 1;
 
 static bool rmds_network_ensure_sample_mutex(void)
 {
@@ -116,17 +135,6 @@ static int64_t rmds_network_now_ms(void)
     return esp_timer_get_time() / 1000;
 }
 
-static void rmds_network_delay_until_ms(int64_t deadline_ms)
-{
-    int64_t now_ms = rmds_network_now_ms();
-
-    if (deadline_ms <= now_ms) {
-        return;
-    }
-
-    vTaskDelay(pdMS_TO_TICKS((uint32_t)(deadline_ms - now_ms)));
-}
-
 static bool rmds_network_copy_latest_sample(rmds_network_sensor_sample_t *sample)
 {
     if (sample == NULL || !rmds_network_ensure_sample_mutex()) {
@@ -141,15 +149,23 @@ static bool rmds_network_copy_latest_sample(rmds_network_sensor_sample_t *sample
 
 static void rmds_network_fill_header(rmds_network_header_t *header,
                                      rmds_network_packet_type_t type,
-                                     uint8_t src_node_id,
+                                     uint8_t origin_node_id,
+                                     uint8_t sender_node_id,
                                      uint8_t dest_node_id,
-                                     uint32_t cycle_id)
+                                     uint8_t gateway_node_id,
+                                     uint8_t hop_count,
+                                     uint8_t max_hops,
+                                     uint32_t sequence)
 {
     header->version = RMDS_NETWORK_PROTOCOL_VERSION;
     header->type = (uint8_t)type;
-    header->src_node_id = src_node_id;
+    header->origin_node_id = origin_node_id;
+    header->sender_node_id = sender_node_id;
     header->dest_node_id = dest_node_id;
-    header->cycle_id = cycle_id;
+    header->gateway_node_id = gateway_node_id;
+    header->hop_count = hop_count;
+    header->max_hops = max_hops;
+    header->sequence = sequence;
 }
 
 static bool rmds_network_try_get_header(const uint8_t *buf,
@@ -191,32 +207,26 @@ static bool rmds_network_wait_for_packet(uint8_t *buf,
     return false;
 }
 
-static bool rmds_network_wait_for_ack(uint8_t node_id,
-                                      uint32_t sequence,
-                                      int64_t deadline_ms)
+static void rmds_network_seen_expire_old(void)
 {
-    uint8_t rx_buf[RMDS_LORA_MAX_PACKET_LEN];
-    int len = 0;
+    int64_t now_ms = rmds_network_now_ms();
+    size_t i;
 
-    while (rmds_network_wait_for_packet(rx_buf, sizeof(rx_buf), deadline_ms, &len)) {
-        rmds_network_header_t header;
-        rmds_network_ack_packet_t ack_packet;
-
-        if (!rmds_network_try_get_header(rx_buf, (size_t)len, &header)) {
-            continue;
+    for (i = 0; i < RMDS_NETWORK_MAX_SEEN_PACKETS; ++i) {
+        if (s_seen[i].used && (now_ms - s_seen[i].seen_at_ms) > RMDS_NETWORK_ROUTE_STALE_MS) {
+            s_seen[i].used = false;
         }
+    }
+}
 
-        if (header.type != RMDS_NETWORK_PKT_ACK || len != (int)sizeof(ack_packet)) {
-            continue;
-        }
+static bool rmds_network_seen_contains(uint8_t origin_node_id, uint32_t sequence)
+{
+    size_t i;
 
-        memcpy(&ack_packet, rx_buf, sizeof(ack_packet));
-        if (ack_packet.header.dest_node_id == node_id && ack_packet.sequence == sequence) {
-            ESP_LOGI(NETWORK_TAG,
-                     "Received ACK for node=%u seq=%" PRIu32 " cycle=%" PRIu32,
-                     (unsigned int)node_id,
-                     sequence,
-                     ack_packet.header.cycle_id);
+    for (i = 0; i < RMDS_NETWORK_MAX_SEEN_PACKETS; ++i) {
+        if (s_seen[i].used &&
+            s_seen[i].origin_node_id == origin_node_id &&
+            s_seen[i].sequence == sequence) {
             return true;
         }
     }
@@ -224,458 +234,429 @@ static bool rmds_network_wait_for_ack(uint8_t node_id,
     return false;
 }
 
-static bool rmds_network_send_sync_packet(int64_t cycle_start_ms)
+static void rmds_network_seen_add(uint8_t origin_node_id, uint32_t sequence)
 {
-    rmds_network_sync_packet_t sync_packet;
-    uint32_t elapsed_ms;
-    uint32_t active_total_ms;
-    uint32_t cycle_period_ms;
+    size_t i;
+    size_t replace_index = 0;
+    int64_t oldest_ms = INT64_MAX;
 
-    elapsed_ms = (uint32_t)(rmds_network_now_ms() - cycle_start_ms);
-    active_total_ms = s_network_config.wake_sync_ms +
-                      s_network_config.primary_tx_window_ms +
-                      s_network_config.ack_window_ms +
-                      s_network_config.retry_window_ms +
-                      s_network_config.sleep_prep_ms;
-    cycle_period_ms = active_total_ms + (s_network_config.sleep_duration_s * 1000U);
+    for (i = 0; i < RMDS_NETWORK_MAX_SEEN_PACKETS; ++i) {
+        if (!s_seen[i].used) {
+            s_seen[i].used = true;
+            s_seen[i].origin_node_id = origin_node_id;
+            s_seen[i].sequence = sequence;
+            s_seen[i].seen_at_ms = rmds_network_now_ms();
+            return;
+        }
 
-    rmds_network_fill_header(&sync_packet.header,
-                             RMDS_NETWORK_PKT_SYNC,
+        if (s_seen[i].seen_at_ms < oldest_ms) {
+            oldest_ms = s_seen[i].seen_at_ms;
+            replace_index = i;
+        }
+    }
+
+    s_seen[replace_index].used = true;
+    s_seen[replace_index].origin_node_id = origin_node_id;
+    s_seen[replace_index].sequence = sequence;
+    s_seen[replace_index].seen_at_ms = rmds_network_now_ms();
+}
+
+static bool rmds_network_have_fresh_route(void)
+{
+    if (!s_route.valid) {
+        return false;
+    }
+
+    return (rmds_network_now_ms() - s_route.last_update_ms) <= RMDS_NETWORK_ROUTE_STALE_MS;
+}
+
+static void rmds_network_maybe_update_route(uint8_t parent_node_id,
+                                            uint8_t route_cost,
+                                            int rssi_dbm)
+{
+    bool better = false;
+
+    if (parent_node_id == s_network_config.node_id) {
+        return;
+    }
+
+    if (!s_route.valid) {
+        better = true;
+    } else if (route_cost < s_route.route_cost) {
+        better = true;
+    } else if (route_cost == s_route.route_cost && rssi_dbm > s_route.rssi_dbm) {
+        better = true;
+    }
+
+    if (better) {
+        s_route.valid = true;
+        s_route.parent_node_id = parent_node_id;
+        s_route.route_cost = route_cost;
+        s_route.rssi_dbm = rssi_dbm;
+        s_route.last_update_ms = rmds_network_now_ms();
+
+        ESP_LOGI(NETWORK_TAG,
+                 "Route updated: parent=%u cost=%u rssi=%d",
+                 (unsigned int)s_route.parent_node_id,
+                 (unsigned int)s_route.route_cost,
+                 s_route.rssi_dbm);
+    }
+}
+
+static bool rmds_network_send_beacon(void)
+{
+    rmds_network_beacon_packet_t pkt;
+
+    rmds_network_fill_header(&pkt.header,
+                             RMDS_NETWORK_PKT_BEACON,
+                             s_network_config.node_id,
                              s_network_config.node_id,
                              RMDS_NETWORK_BROADCAST_NODE,
-                             s_fallback_cycle_id);
-    sync_packet.ms_until_primary_window =
-        (elapsed_ms >= s_network_config.wake_sync_ms)
-            ? 0
-            : (uint16_t)(s_network_config.wake_sync_ms - elapsed_ms);
-    sync_packet.ms_until_ack_window =
-        (elapsed_ms >= (s_network_config.wake_sync_ms + s_network_config.primary_tx_window_ms))
-            ? 0
-            : (uint16_t)((s_network_config.wake_sync_ms +
-                          s_network_config.primary_tx_window_ms) - elapsed_ms);
-    sync_packet.ms_until_retry_window =
-        (elapsed_ms >= (s_network_config.wake_sync_ms +
-                        s_network_config.primary_tx_window_ms +
-                        s_network_config.ack_window_ms))
-            ? 0
-            : (uint16_t)((s_network_config.wake_sync_ms +
-                          s_network_config.primary_tx_window_ms +
-                          s_network_config.ack_window_ms) - elapsed_ms);
-    sync_packet.ms_until_sleep_prep =
-        (elapsed_ms >= active_total_ms)
-            ? 0
-            : (uint16_t)(active_total_ms - elapsed_ms);
-    sync_packet.cycle_period_ms = (uint16_t)cycle_period_ms;
+                             s_network_config.gateway_node_id,
+                             0,
+                             RMDS_NETWORK_MAX_HOPS,
+                             0);
 
-    return rmds_lora_send(&sync_packet, sizeof(sync_packet));
-}
-
-static bool rmds_network_send_data_packet(const rmds_network_sensor_sample_t *sample,
-                                          uint32_t cycle_id,
-                                          uint32_t sequence)
-{
-    rmds_network_data_packet_t data_packet;
-
-    if (sample == NULL || !sample->valid) {
+    if (s_network_config.role == RMDS_NETWORK_ROLE_GATEWAY) {
+        pkt.route_cost = 0;
+    } else if (rmds_network_have_fresh_route()) {
+        pkt.route_cost = (uint8_t)(s_route.route_cost);
+    } else {
         return false;
     }
 
-    rmds_network_fill_header(&data_packet.header,
-                             RMDS_NETWORK_PKT_DATA,
-                             s_network_config.node_id,
-                             s_network_config.master_node_id,
-                             cycle_id);
-    data_packet.sequence = sequence;
-    data_packet.concentration_ppm = sample->concentration_ppm;
-    data_packet.faults = sample->faults;
-    data_packet.temp_deci_kelvin = sample->temp_deci_kelvin;
-    data_packet.sensor_crc = sample->sensor_crc;
-    data_packet.sensor_crc_inv = sample->sensor_crc_inv;
-
-    return rmds_lora_send(&data_packet, sizeof(data_packet));
+    return rmds_lora_send(&pkt, sizeof(pkt));
 }
 
-static bool rmds_network_send_ack_packet(uint8_t dest_node_id, uint32_t cycle_id, uint32_t sequence)
+static bool rmds_network_send_ack(uint8_t origin_node_id,
+                                  uint8_t dest_node_id,
+                                  uint32_t sequence)
 {
-    rmds_network_ack_packet_t ack_packet;
+    rmds_network_ack_packet_t pkt;
 
-    rmds_network_fill_header(&ack_packet.header,
+    rmds_network_fill_header(&pkt.header,
                              RMDS_NETWORK_PKT_ACK,
+                             origin_node_id,
                              s_network_config.node_id,
                              dest_node_id,
-                             cycle_id);
-    ack_packet.sequence = sequence;
+                             s_network_config.gateway_node_id,
+                             0,
+                             RMDS_NETWORK_MAX_HOPS,
+                             sequence);
 
-    return rmds_lora_send(&ack_packet, sizeof(ack_packet));
+    return rmds_lora_send(&pkt, sizeof(pkt));
 }
 
-static bool rmds_network_receive_sync_schedule(rmds_network_sensor_schedule_t *schedule)
+static bool rmds_network_send_local_data(void)
 {
-    uint8_t rx_buf[RMDS_LORA_MAX_PACKET_LEN];
-    int len = 0;
-    int64_t sync_deadline_ms;
+    rmds_network_sensor_sample_t sample;
+    rmds_network_data_packet_t pkt;
 
-    if (schedule == NULL) {
+    if (s_network_config.role == RMDS_NETWORK_ROLE_GATEWAY) {
         return false;
     }
 
-    memset(schedule, 0, sizeof(*schedule));
-    sync_deadline_ms = rmds_network_now_ms() + s_network_config.wake_sync_ms;
-
-    while (rmds_network_wait_for_packet(rx_buf, sizeof(rx_buf), sync_deadline_ms, &len)) {
-        rmds_network_header_t header;
-        rmds_network_sync_packet_t sync_packet;
-        int64_t packet_rx_ms = rmds_network_now_ms();
-
-        if (!rmds_network_try_get_header(rx_buf, (size_t)len, &header)) {
-            continue;
-        }
-
-        if (header.type != RMDS_NETWORK_PKT_SYNC || len != (int)sizeof(sync_packet)) {
-            continue;
-        }
-
-        memcpy(&sync_packet, rx_buf, sizeof(sync_packet));
-        if (sync_packet.header.src_node_id != s_network_config.master_node_id) {
-            continue;
-        }
-
-        schedule->primary_open_ms = packet_rx_ms + sync_packet.ms_until_primary_window;
-        schedule->ack_open_ms = packet_rx_ms + sync_packet.ms_until_ack_window;
-        schedule->retry_open_ms = packet_rx_ms + sync_packet.ms_until_retry_window;
-        schedule->sleep_prep_ms = packet_rx_ms + sync_packet.ms_until_sleep_prep;
-        schedule->cycle_id = sync_packet.header.cycle_id;
-        schedule->synced = true;
-        return true;
+    if (!rmds_network_have_fresh_route()) {
+        ESP_LOGW(NETWORK_TAG, "No route to gateway; local data not sent");
+        return false;
     }
 
-    schedule->primary_open_ms = sync_deadline_ms;
-    schedule->ack_open_ms = schedule->primary_open_ms + s_network_config.primary_tx_window_ms;
-    schedule->retry_open_ms = schedule->ack_open_ms + s_network_config.ack_window_ms;
-    schedule->sleep_prep_ms = schedule->retry_open_ms + s_network_config.retry_window_ms;
-    schedule->cycle_id = s_fallback_cycle_id++;
-    schedule->synced = false;
-    return false;
-}
-
-static rmds_network_rx_record_t *rmds_network_find_record(rmds_network_rx_record_t *records,
-                                                          size_t count,
-                                                          uint8_t node_id,
-                                                          uint32_t sequence)
-{
-    size_t i;
-
-    for (i = 0; i < count; ++i) {
-        if (records[i].used && records[i].node_id == node_id && records[i].sequence == sequence) {
-            return &records[i];
-        }
+    if (!rmds_network_copy_latest_sample(&sample)) {
+        ESP_LOGW(NETWORK_TAG, "No valid local sensor sample");
+        return false;
     }
 
-    return NULL;
+    rmds_network_fill_header(&pkt.header,
+                             RMDS_NETWORK_PKT_DATA,
+                             s_network_config.node_id,
+                             s_network_config.node_id,
+                             s_route.parent_node_id,
+                             s_network_config.gateway_node_id,
+                             0,
+                             RMDS_NETWORK_MAX_HOPS,
+                             s_next_sequence++);
+
+    pkt.concentration_ppm = sample.concentration_ppm;
+    pkt.faults = sample.faults;
+    pkt.temp_deci_kelvin = sample.temp_deci_kelvin;
+    pkt.sensor_crc = sample.sensor_crc;
+    pkt.sensor_crc_inv = sample.sensor_crc_inv;
+
+    ESP_LOGI(NETWORK_TAG,
+             "Sending local data seq=%" PRIu32 " parent=%u conc=%" PRIu32,
+             pkt.header.sequence,
+             (unsigned int)pkt.header.dest_node_id,
+             pkt.concentration_ppm);
+
+    return rmds_lora_send(&pkt, sizeof(pkt));
 }
 
-static rmds_network_rx_record_t *rmds_network_alloc_record(rmds_network_rx_record_t *records,
-                                                           size_t count)
+static bool rmds_network_forward_data(const rmds_network_data_packet_t *incoming)
 {
-    size_t i;
+    rmds_network_data_packet_t pkt;
 
-    for (i = 0; i < count; ++i) {
-        if (!records[i].used) {
-            memset(&records[i], 0, sizeof(records[i]));
-            records[i].used = true;
-            return &records[i];
-        }
+    if (incoming == NULL) {
+        return false;
     }
 
-    return NULL;
+    if (!rmds_network_have_fresh_route()) {
+        ESP_LOGW(NETWORK_TAG,
+                 "No route available to forward origin=%u seq=%" PRIu32,
+                 (unsigned int)incoming->header.origin_node_id,
+                 incoming->header.sequence);
+        return false;
+    }
+
+    if (incoming->header.hop_count >= incoming->header.max_hops) {
+        ESP_LOGW(NETWORK_TAG,
+                 "Hop limit reached for origin=%u seq=%" PRIu32,
+                 (unsigned int)incoming->header.origin_node_id,
+                 incoming->header.sequence);
+        return false;
+    }
+
+    pkt = *incoming;
+    pkt.header.sender_node_id = s_network_config.node_id;
+    pkt.header.dest_node_id = s_route.parent_node_id;
+    pkt.header.hop_count++;
+
+    vTaskDelay(pdMS_TO_TICKS(RMDS_NETWORK_FORWARD_DELAY_MS + (esp_random() % 20U)));
+
+    ESP_LOGI(NETWORK_TAG,
+             "Forwarding origin=%u seq=%" PRIu32 " via parent=%u hop=%u",
+             (unsigned int)pkt.header.origin_node_id,
+             pkt.header.sequence,
+             (unsigned int)pkt.header.dest_node_id,
+             (unsigned int)pkt.header.hop_count);
+
+    return rmds_lora_send(&pkt, sizeof(pkt));
 }
 
-static void rmds_network_record_rx_packet(rmds_network_rx_record_t *records,
-                                          const rmds_network_data_packet_t *packet,
-                                          int rssi_dbm,
-                                          float snr_db)
+static void rmds_network_gateway_consume_data(const rmds_network_data_packet_t *pkt,
+                                              int rssi_dbm,
+                                              float snr_db)
 {
-    rmds_network_rx_record_t *record;
+    rmds_wifi_cloud_frame_t frame;
 
-    record = rmds_network_find_record(records,
-                                      RMDS_NETWORK_MAX_TRACKED_RX,
-                                      packet->header.src_node_id,
-                                      packet->sequence);
-    if (record != NULL) {
+    memset(&frame, 0, sizeof(frame));
+    frame.node_id = pkt->header.origin_node_id;
+    frame.network_seq = pkt->header.sequence;
+    frame.concentration_ppm = pkt->concentration_ppm;
+    frame.faults = pkt->faults;
+    frame.temperature_k = pkt->temp_deci_kelvin / 10.0f;
+    frame.sensor_crc = pkt->sensor_crc;
+    frame.sensor_crc_inv = pkt->sensor_crc_inv;
+    frame.rssi_dbm = rssi_dbm;
+    frame.snr_db = snr_db;
+
+    ESP_LOGI(NETWORK_TAG,
+             "Gateway received data origin=%u seq=%" PRIu32 " conc=%" PRIu32,
+             (unsigned int)pkt->header.origin_node_id,
+             pkt->header.sequence,
+             pkt->concentration_ppm);
+
+    if (!rmds_wifi_enqueue_frame(&frame)) {
+        ESP_LOGW(NETWORK_TAG,
+                 "Failed to enqueue cloud frame origin=%u seq=%" PRIu32,
+                 (unsigned int)pkt->header.origin_node_id,
+                 pkt->header.sequence);
+    }
+}
+
+static void rmds_network_handle_beacon(const rmds_network_beacon_packet_t *pkt)
+{
+    uint8_t advertised_cost;
+
+    if (pkt == NULL) {
         return;
     }
 
-    record = rmds_network_alloc_record(records, RMDS_NETWORK_MAX_TRACKED_RX);
-    if (record == NULL) {
-        ESP_LOGW(NETWORK_TAG,
-                 "Tracking table full, dropping node=%u seq=%" PRIu32,
-                 (unsigned int)packet->header.src_node_id,
-                 packet->sequence);
+    if (pkt->header.origin_node_id == s_network_config.node_id) {
         return;
     }
 
-    record->node_id = packet->header.src_node_id;
-    record->sequence = packet->sequence;
-    record->cloud_frame.node_id = packet->header.src_node_id;
-    record->cloud_frame.network_seq = packet->sequence;
-    record->cloud_frame.concentration_ppm = packet->concentration_ppm;
-    record->cloud_frame.faults = packet->faults;
-    record->cloud_frame.temperature_k = packet->temp_deci_kelvin / 10.0f;
-    record->cloud_frame.sensor_crc = packet->sensor_crc;
-    record->cloud_frame.sensor_crc_inv = packet->sensor_crc_inv;
-    record->cloud_frame.rssi_dbm = rssi_dbm;
-    record->cloud_frame.snr_db = snr_db;
+    if (pkt->header.gateway_node_id != s_network_config.gateway_node_id) {
+        return;
+    }
 
-    if (!rmds_wifi_enqueue_frame(&record->cloud_frame)) {
-        ESP_LOGW(NETWORK_TAG,
-                 "Failed to queue cloud frame for node=%u seq=%" PRIu32,
-                 (unsigned int)record->node_id,
-                 record->sequence);
+    if (pkt->route_cost >= RMDS_NETWORK_MAX_HOPS) {
+        return;
+    }
+
+    advertised_cost = (uint8_t)(pkt->route_cost + 1U);
+    rmds_network_maybe_update_route(pkt->header.sender_node_id,
+                                    advertised_cost,
+                                    rmds_lora_last_packet_rssi());
+}
+
+static void rmds_network_handle_data(const rmds_network_data_packet_t *pkt)
+{
+    bool duplicate;
+
+    if (pkt == NULL) {
+        return;
+    }
+
+    if (pkt->header.gateway_node_id != s_network_config.gateway_node_id) {
+        return;
+    }
+
+    if (pkt->header.origin_node_id == s_network_config.node_id) {
+        return;
+    }
+
+    rmds_network_seen_expire_old();
+    duplicate = rmds_network_seen_contains(pkt->header.origin_node_id, pkt->header.sequence);
+    if (duplicate) {
+        ESP_LOGI(NETWORK_TAG,
+                 "Duplicate dropped origin=%u seq=%" PRIu32,
+                 (unsigned int)pkt->header.origin_node_id,
+                 pkt->header.sequence);
+        return;
+    }
+
+    rmds_network_seen_add(pkt->header.origin_node_id, pkt->header.sequence);
+
+    if (s_network_config.role == RMDS_NETWORK_ROLE_GATEWAY) {
+        rmds_network_gateway_consume_data(pkt,
+                                          rmds_lora_last_packet_rssi(),
+                                          rmds_lora_last_packet_snr());
+        rmds_network_send_ack(pkt->header.origin_node_id,
+                              pkt->header.sender_node_id,
+                              pkt->header.sequence);
+        rmds_lora_start_listening();
+        return;
+    }
+
+    if (!rmds_network_forward_data(pkt)) {
+        rmds_lora_start_listening();
+    } else {
+        rmds_lora_start_listening();
     }
 }
 
-static void rmds_network_process_master_rx_window(rmds_network_rx_record_t *records, int64_t deadline_ms)
+static void rmds_network_handle_ack(const rmds_network_ack_packet_t *pkt)
+{
+    if (pkt == NULL) {
+        return;
+    }
+
+    if (pkt->header.dest_node_id != s_network_config.node_id) {
+        return;
+    }
+
+    ESP_LOGI(NETWORK_TAG,
+             "ACK received for origin=%u seq=%" PRIu32,
+             (unsigned int)pkt->header.origin_node_id,
+             pkt->header.sequence);
+}
+
+static void rmds_network_process_incoming_once(int64_t deadline_ms)
 {
     uint8_t rx_buf[RMDS_LORA_MAX_PACKET_LEN];
     int len = 0;
+    rmds_network_header_t header;
 
-    while (rmds_network_wait_for_packet(rx_buf, sizeof(rx_buf), deadline_ms, &len)) {
-        rmds_network_header_t header;
-        rmds_network_data_packet_t data_packet;
+    if (!rmds_network_wait_for_packet(rx_buf, sizeof(rx_buf), deadline_ms, &len)) {
+        return;
+    }
 
-        if (!rmds_network_try_get_header(rx_buf, (size_t)len, &header)) {
-            continue;
+    if (!rmds_network_try_get_header(rx_buf, (size_t)len, &header)) {
+        return;
+    }
+
+    switch ((rmds_network_packet_type_t)header.type) {
+    case RMDS_NETWORK_PKT_BEACON:
+        if (len == (int)sizeof(rmds_network_beacon_packet_t)) {
+            rmds_network_beacon_packet_t pkt;
+            memcpy(&pkt, rx_buf, sizeof(pkt));
+            rmds_network_handle_beacon(&pkt);
         }
+        break;
 
-        if (header.type != RMDS_NETWORK_PKT_DATA || len != (int)sizeof(data_packet)) {
-            continue;
+    case RMDS_NETWORK_PKT_DATA:
+        if (len == (int)sizeof(rmds_network_data_packet_t)) {
+            rmds_network_data_packet_t pkt;
+            memcpy(&pkt, rx_buf, sizeof(pkt));
+            rmds_network_handle_data(&pkt);
         }
+        break;
 
-        memcpy(&data_packet, rx_buf, sizeof(data_packet));
-        if (data_packet.header.dest_node_id != s_network_config.node_id) {
-            continue;
+    case RMDS_NETWORK_PKT_ACK:
+        if (len == (int)sizeof(rmds_network_ack_packet_t)) {
+            rmds_network_ack_packet_t pkt;
+            memcpy(&pkt, rx_buf, sizeof(pkt));
+            rmds_network_handle_ack(&pkt);
         }
+        break;
 
-        ESP_LOGI(NETWORK_TAG,
-                 "RX data from node=%u seq=%" PRIu32 " conc=%" PRIu32 " faults=%" PRIu32,
-                 (unsigned int)data_packet.header.src_node_id,
-                 data_packet.sequence,
-                 data_packet.concentration_ppm,
-                 data_packet.faults);
-
-        rmds_network_record_rx_packet(records,
-                                      &data_packet,
-                                      rmds_lora_last_packet_rssi(),
-                                      rmds_lora_last_packet_snr());
+    default:
+        break;
     }
 }
 
-static void rmds_network_sensor_task(void *pvParameters)
+static void rmds_network_mesh_task(void *pvParameters)
 {
-    rmds_network_sensor_schedule_t schedule;
+    int64_t next_beacon_ms;
+    int64_t next_send_ms;
 
     (void)pvParameters;
 
     if (!rmds_lora_init(rmds_lora_default_config())) {
-        ESP_LOGE(NETWORK_TAG, "Failed to initialize LoRa for sensor node");
+        ESP_LOGE(NETWORK_TAG, "Failed to initialize LoRa");
         vTaskDelete(NULL);
         return;
     }
+
+    memset(&s_route, 0, sizeof(s_route));
+    memset(s_seen, 0, sizeof(s_seen));
+
+    if (s_network_config.role == RMDS_NETWORK_ROLE_GATEWAY) {
+        s_route.valid = true;
+        s_route.parent_node_id = s_network_config.node_id;
+        s_route.route_cost = 0;
+        s_route.rssi_dbm = 0;
+        s_route.last_update_ms = rmds_network_now_ms();
+    }
+
+    next_beacon_ms = rmds_network_now_ms() + 500;
+    next_send_ms = rmds_network_now_ms() + 3000 + (esp_random() % 1500U);
 
     rmds_lora_start_listening();
-    rmds_network_receive_sync_schedule(&schedule);
-
-    if (schedule.synced) {
-        ESP_LOGI(NETWORK_TAG,
-                 "Sensor node synced to cycle=%" PRIu32,
-                 schedule.cycle_id);
-    } else {
-        ESP_LOGW(NETWORK_TAG, "No sync received, falling back to local schedule");
-    }
-
-    {
-        rmds_network_sensor_sample_t sample;
-        uint32_t sequence;
-        int64_t primary_send_deadline_ms;
-        int64_t tx_time_ms;
-        uint32_t jitter_window_ms;
-        bool acked = false;
-        bool sample_ready = false;
-
-        primary_send_deadline_ms = schedule.ack_open_ms - RMDS_NETWORK_GUARD_MS;
-        if (primary_send_deadline_ms <= schedule.primary_open_ms) {
-            primary_send_deadline_ms = schedule.primary_open_ms;
-        }
-
-        jitter_window_ms = (uint32_t)(primary_send_deadline_ms - schedule.primary_open_ms);
-        tx_time_ms = schedule.primary_open_ms +
-                     ((jitter_window_ms == 0U) ? 0 : (esp_random() % (jitter_window_ms + 1U)));
-        rmds_network_delay_until_ms(tx_time_ms);
-
-        sample_ready = rmds_network_copy_latest_sample(&sample);
-        sequence = s_next_sequence++;
-
-        if (!sample_ready) {
-            ESP_LOGW(NETWORK_TAG, "No local sensor sample available for this cycle");
-        } else if (!rmds_network_send_data_packet(&sample, schedule.cycle_id, sequence)) {
-            ESP_LOGE(NETWORK_TAG, "Failed to send primary uplink seq=%" PRIu32, sequence);
-        } else {
-            ESP_LOGI(NETWORK_TAG,
-                     "Primary TX sent seq=%" PRIu32 " conc=%" PRIu32,
-                     sequence,
-                     sample.concentration_ppm);
-        }
-
-        if (sample_ready) {
-            acked = rmds_network_wait_for_ack(s_network_config.node_id,
-                                              sequence,
-                                              schedule.retry_open_ms);
-        }
-
-        if (sample_ready && !acked) {
-            int64_t retry_send_deadline_ms = schedule.sleep_prep_ms - RMDS_NETWORK_GUARD_MS;
-            uint32_t retry_jitter_ms;
-
-            if (retry_send_deadline_ms <= schedule.retry_open_ms) {
-                retry_send_deadline_ms = schedule.retry_open_ms;
-            }
-
-            retry_jitter_ms = (uint32_t)(retry_send_deadline_ms - schedule.retry_open_ms);
-            tx_time_ms = schedule.retry_open_ms +
-                         ((retry_jitter_ms == 0U) ? 0 : (esp_random() % (retry_jitter_ms + 1U)));
-            rmds_network_delay_until_ms(tx_time_ms);
-
-            if (rmds_network_send_data_packet(&sample, schedule.cycle_id, sequence)) {
-                ESP_LOGW(NETWORK_TAG, "Retransmitted seq=%" PRIu32, sequence);
-                acked = rmds_network_wait_for_ack(s_network_config.node_id,
-                                                  sequence,
-                                                  schedule.sleep_prep_ms);
-            }
-        }
-
-        if (!acked) {
-            ESP_LOGW(NETWORK_TAG, "No ACK received for seq=%" PRIu32, sequence);
-        }
-    }
-
-    rmds_network_delay_until_ms(schedule.sleep_prep_ms);
-    rmds_lora_sleep_radio();
-    ESP_LOGI(NETWORK_TAG,
-             "Entering deep sleep for %u seconds",
-             (unsigned int)s_network_config.sleep_duration_s);
-    enter_deep_sleep(s_network_config.sleep_duration_s);
-}
-
-static void rmds_network_master_task(void *pvParameters)
-{
-    (void)pvParameters;
-
-    if (!rmds_lora_init(rmds_lora_default_config())) {
-        ESP_LOGE(NETWORK_TAG, "Failed to initialize LoRa for master node");
-        vTaskDelete(NULL);
-        return;
-    }
 
     while (1) {
-        int64_t cycle_start_ms = rmds_network_now_ms();
-        int64_t sync_end_ms = cycle_start_ms + s_network_config.wake_sync_ms;
-        int64_t primary_end_ms = sync_end_ms + s_network_config.primary_tx_window_ms;
-        int64_t ack_end_ms = primary_end_ms + s_network_config.ack_window_ms;
-        int64_t retry_end_ms = ack_end_ms + s_network_config.retry_window_ms;
-        int64_t sleep_prep_end_ms = retry_end_ms + s_network_config.sleep_prep_ms;
-        rmds_network_rx_record_t records[RMDS_NETWORK_MAX_TRACKED_RX];
+        int64_t now_ms = rmds_network_now_ms();
 
-        memset(records, 0, sizeof(records));
-        ESP_LOGI(NETWORK_TAG,
-                 "Master cycle=%" PRIu32 " started",
-                 s_fallback_cycle_id);
-
-        while (rmds_network_now_ms() < sync_end_ms) {
-            if (!rmds_network_send_sync_packet(cycle_start_ms)) {
-                ESP_LOGW(NETWORK_TAG, "Failed to send sync packet");
+        if (now_ms >= next_beacon_ms) {
+            if (rmds_network_send_beacon()) {
+                ESP_LOGI(NETWORK_TAG,
+                         "Beacon sent role=%s node=%u",
+                         rmds_network_role_to_string(s_network_config.role),
+                         (unsigned int)s_network_config.node_id);
             }
-            vTaskDelay(pdMS_TO_TICKS(s_network_config.sync_broadcast_interval_ms));
+            rmds_lora_start_listening();
+            next_beacon_ms = now_ms + RMDS_NETWORK_BEACON_INTERVAL_MS;
         }
 
-        rmds_network_process_master_rx_window(records, primary_end_ms);
-
-        {
-            size_t i;
-
-            for (i = 0; i < RMDS_NETWORK_MAX_TRACKED_RX; ++i) {
-                if (!records[i].used || records[i].ack_sent) {
-                    continue;
-                }
-
-                if (rmds_network_send_ack_packet(records[i].node_id,
-                                                 s_fallback_cycle_id,
-                                                 records[i].sequence)) {
-                    records[i].ack_sent = true;
-                    ESP_LOGI(NETWORK_TAG,
-                             "ACK sent to node=%u seq=%" PRIu32,
-                             (unsigned int)records[i].node_id,
-                             records[i].sequence);
-                }
-                vTaskDelay(pdMS_TO_TICKS(RMDS_NETWORK_ACK_SPACING_MS));
-            }
+        if (s_network_config.role == RMDS_NETWORK_ROLE_MESH_NODE &&
+            now_ms >= next_send_ms) {
+            rmds_network_send_local_data();
+            rmds_lora_start_listening();
+            next_send_ms = now_ms + RMDS_NETWORK_SEND_INTERVAL_MS + (esp_random() % 2000U);
         }
 
-        while (rmds_network_now_ms() < retry_end_ms) {
-            uint8_t rx_buf[RMDS_LORA_MAX_PACKET_LEN];
-            int len = 0;
-
-            if (!rmds_network_wait_for_packet(rx_buf, sizeof(rx_buf), retry_end_ms, &len)) {
-                break;
-            }
-
-            {
-                rmds_network_header_t header;
-                rmds_network_data_packet_t data_packet;
-
-                if (!rmds_network_try_get_header(rx_buf, (size_t)len, &header)) {
-                    continue;
-                }
-
-                if (header.type != RMDS_NETWORK_PKT_DATA || len != (int)sizeof(data_packet)) {
-                    continue;
-                }
-
-                memcpy(&data_packet, rx_buf, sizeof(data_packet));
-                if (data_packet.header.dest_node_id != s_network_config.node_id) {
-                    continue;
-                }
-
-                rmds_network_record_rx_packet(records,
-                                              &data_packet,
-                                              rmds_lora_last_packet_rssi(),
-                                              rmds_lora_last_packet_snr());
-                vTaskDelay(pdMS_TO_TICKS(RMDS_NETWORK_ACK_TURN_MS));
-                rmds_network_send_ack_packet(data_packet.header.src_node_id,
-                                             s_fallback_cycle_id,
-                                             data_packet.sequence);
-            }
-        }
-
-        rmds_network_delay_until_ms(sleep_prep_end_ms);
-        rmds_lora_start_listening();
-        ESP_LOGI(NETWORK_TAG,
-                 "Master waiting %u seconds before next sync phase",
-                 (unsigned int)s_network_config.sleep_duration_s);
-        vTaskDelay(pdMS_TO_TICKS(s_network_config.sleep_duration_s * 1000U));
-        s_fallback_cycle_id++;
+        rmds_network_process_incoming_once(now_ms + 100);
     }
 }
 
 bool rmds_network_start(const rmds_network_config_t *config)
 {
-    TaskFunction_t task_entry = NULL;
-
     if (config == NULL || s_network_started) {
         return false;
     }
 
-    if (config->role != RMDS_NETWORK_ROLE_SENSOR &&
-        config->role != RMDS_NETWORK_ROLE_MASTER) {
+    if (config->role != RMDS_NETWORK_ROLE_GATEWAY &&
+        config->role != RMDS_NETWORK_ROLE_MESH_NODE) {
         return false;
     }
 
@@ -684,11 +665,8 @@ bool rmds_network_start(const rmds_network_config_t *config)
     }
 
     s_network_config = *config;
-    task_entry = (config->role == RMDS_NETWORK_ROLE_MASTER)
-                     ? rmds_network_master_task
-                     : rmds_network_sensor_task;
 
-    if (xTaskCreate(task_entry,
+    if (xTaskCreate(rmds_network_mesh_task,
                     "rmds_network_task",
                     RMDS_NETWORK_TASK_STACK,
                     NULL,
@@ -700,10 +678,10 @@ bool rmds_network_start(const rmds_network_config_t *config)
 
     s_network_started = true;
     ESP_LOGI(NETWORK_TAG,
-             "Started network role=%s node=%u master=%u",
+             "Started mesh role=%s node=%u gateway=%u",
              rmds_network_role_to_string(config->role),
              (unsigned int)config->node_id,
-             (unsigned int)config->master_node_id);
+             (unsigned int)config->gateway_node_id);
     return true;
 }
 
@@ -722,10 +700,10 @@ bool rmds_network_update_local_sample(const rmds_network_sensor_sample_t *sample
 const char *rmds_network_role_to_string(rmds_network_role_t role)
 {
     switch (role) {
-    case RMDS_NETWORK_ROLE_SENSOR:
-        return "sensor";
-    case RMDS_NETWORK_ROLE_MASTER:
-        return "master";
+    case RMDS_NETWORK_ROLE_GATEWAY:
+        return "gateway";
+    case RMDS_NETWORK_ROLE_MESH_NODE:
+        return "mesh_node";
     default:
         return "unknown";
     }

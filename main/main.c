@@ -19,12 +19,20 @@
 #define APP_TAG  "RMDS_APP"
 #define TAG_UART "UART_RX"
 
-// Manual role selection for each flashed node.
-// Set to RMDS_NETWORK_ROLE_MASTER for the always-on gateway node.
-// Set to RMDS_NETWORK_ROLE_SENSOR for every sleeping field node.
-#define RMDS_APP_NODE_ROLE   RMDS_NETWORK_ROLE_SENSOR
-#define RMDS_APP_NODE_ID     1
-#define RMDS_MASTER_NODE_ID  0
+/*
+ * Flash gateway with:
+ *   RMDS_APP_NODE_ROLE = RMDS_NETWORK_ROLE_GATEWAY
+ *   RMDS_APP_NODE_ID   = 0
+ *
+ * Flash mesh nodes with:
+ *   RMDS_APP_NODE_ROLE = RMDS_NETWORK_ROLE_MESH_NODE
+ *   RMDS_APP_NODE_ID   = unique nonzero ID
+ *
+ * All nodes should use the same gateway ID.
+ */
+#define RMDS_APP_NODE_ROLE    RMDS_NETWORK_ROLE_GATEWAY
+#define RMDS_APP_NODE_ID      0
+#define RMDS_APP_GATEWAY_ID   0
 
 // UART configuration (UART1 on GPIO 14/25) for methane sensor nodes.
 #define SENSOR_UART_NUM   UART_NUM_1
@@ -46,14 +54,7 @@ typedef struct {
 static const rmds_network_config_t s_network_config = {
     .role = RMDS_APP_NODE_ROLE,
     .node_id = RMDS_APP_NODE_ID,
-    .master_node_id = RMDS_MASTER_NODE_ID,
-    .wake_sync_ms = 500,
-    .primary_tx_window_ms = 4000,
-    .ack_window_ms = 2000,
-    .retry_window_ms = 3000,
-    .sleep_prep_ms = 500,
-    .sleep_duration_s = 50,
-    .sync_broadcast_interval_ms = 125,
+    .gateway_node_id = RMDS_APP_GATEWAY_ID,
 };
 
 static uint32_t parse_hex32(const char *s)
@@ -222,16 +223,16 @@ void app_main(void)
     check_wake_reason();
 
     ESP_LOGI(APP_TAG,
-             "Booting role=%s node=%u master=%u",
+             "Booting role=%s node=%u gateway=%u",
              rmds_network_role_to_string(s_network_config.role),
              (unsigned int)s_network_config.node_id,
-             (unsigned int)s_network_config.master_node_id);
+             (unsigned int)s_network_config.gateway_node_id);
 
-    if (s_network_config.role == RMDS_NETWORK_ROLE_MASTER) {
-        ESP_LOGI(APP_TAG, "Starting always-on master gateway");
+    if (s_network_config.role == RMDS_NETWORK_ROLE_GATEWAY) {
+        ESP_LOGI(APP_TAG, "Starting always-on mesh gateway");
         rmds_wifi_init();
     } else {
-        ESP_LOGI(APP_TAG, "Starting sleeping sensor node");
+        ESP_LOGI(APP_TAG, "Starting mesh sensor node");
         init_uart_sensor();
 
         if (xTaskCreate(uart_rx_task,

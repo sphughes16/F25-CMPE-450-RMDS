@@ -8,8 +8,8 @@ extern "C" {
 #include <stdint.h>
 
 typedef enum {
-    RMDS_NETWORK_ROLE_SENSOR = 0,
-    RMDS_NETWORK_ROLE_MASTER = 1,
+    RMDS_NETWORK_ROLE_MESH_NODE = 0,
+    RMDS_NETWORK_ROLE_GATEWAY   = 1,
 } rmds_network_role_t;
 
 typedef struct {
@@ -24,14 +24,7 @@ typedef struct {
 typedef struct {
     rmds_network_role_t role;
     uint8_t node_id;
-    uint8_t master_node_id;
-    uint32_t wake_sync_ms;
-    uint32_t primary_tx_window_ms;
-    uint32_t ack_window_ms;
-    uint32_t retry_window_ms;
-    uint32_t sleep_prep_ms;
-    uint32_t sleep_duration_s;
-    uint32_t sync_broadcast_interval_ms;
+    uint8_t gateway_node_id;
 } rmds_network_config_t;
 
 bool rmds_network_start(const rmds_network_config_t *config);

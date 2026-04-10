@@ -438,6 +438,14 @@ CONFIG_APP_BUILD_GENERATE_BINARIES=y
 CONFIG_APP_BUILD_BOOTLOADER=y
 # default:
 CONFIG_APP_BUILD_USE_FLASH_SECTIONS=y
+
+#
+# Minimize binary changes between builds
+#
+# default:
+# CONFIG_APP_BUILD_MINIMIZE_BINARY_CHANGES is not set
+# end of Minimize binary changes between builds
+
 # default:
 # CONFIG_APP_REPRODUCIBLE_BUILD is not set
 # default:
@@ -690,11 +698,6 @@ CONFIG_ESPTOOLPY_AFTER_RESET=y
 CONFIG_ESPTOOLPY_AFTER="hard-reset"
 # default:
 CONFIG_ESPTOOLPY_MONITOR_BAUD=115200
-
-#
-# Fast Reflashing
-#
-# end of Fast Reflashing
 # end of Serial flasher config
 
 #
