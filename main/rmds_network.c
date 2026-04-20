@@ -27,27 +27,10 @@
 
 #define RMDS_NETWORK_MAX_SEEN_PACKETS      32
 #define RMDS_NETWORK_MAX_HOPS              8
-#define RMDS_NETWORK_BEACON_INTERVAL_MS    4000
-#define RMDS_NETWORK_ROUTE_STALE_MS        15000
+#define RMDS_NETWORK_BEACON_INTERVAL_MS    2000
+#define RMDS_NETWORK_ROUTE_STALE_MS        60000
 #define RMDS_NETWORK_FORWARD_DELAY_MS      25
-#define RMDS_NETWORK_SEND_INTERVAL_MS      5000
-
-/*
- * IMPORTANT:
- * This file assumes your header supports two roles:
- *
- *   RMDS_NETWORK_ROLE_GATEWAY
- *   RMDS_NETWORK_ROLE_MESH_NODE
- *
- * and that config has:
- *
- *   role
- *   node_id
- *   gateway_node_id
- *   sleep_duration_s   (optional, not used here)
- *
- * If your current header still uses MASTER/SENSOR, update it first.
- */
+#define RMDS_NETWORK_SEND_INTERVAL_MS      30000
 
 typedef enum {
     RMDS_NETWORK_PKT_BEACON = 1,
@@ -58,10 +41,10 @@ typedef enum {
 typedef struct __attribute__((packed)) {
     uint8_t version;
     uint8_t type;
-    uint8_t origin_node_id;   /* who originally created this packet */
-    uint8_t sender_node_id;   /* who transmitted this copy */
-    uint8_t dest_node_id;     /* next hop or broadcast */
-    uint8_t gateway_node_id;  /* final sink */
+    uint8_t origin_node_id;
+    uint8_t sender_node_id;
+    uint8_t dest_node_id;
+    uint8_t gateway_node_id;
     uint8_t hop_count;
     uint8_t max_hops;
     uint32_t sequence;
@@ -69,7 +52,7 @@ typedef struct __attribute__((packed)) {
 
 typedef struct __attribute__((packed)) {
     rmds_network_header_t header;
-    uint8_t route_cost;       /* cost to gateway; gateway advertises 0 */
+    uint8_t route_cost;
 } rmds_network_beacon_packet_t;
 
 typedef struct __attribute__((packed)) {
@@ -111,6 +94,10 @@ static rmds_network_config_t s_network_config;
 
 static rmds_network_route_t s_route;
 static rmds_network_seen_packet_t s_seen[RMDS_NETWORK_MAX_SEEN_PACKETS];
+
+static bool s_prefer_local_tx = true;
+static bool s_have_pending_forward = false;
+static rmds_network_data_packet_t s_pending_forward_pkt;
 
 RTC_DATA_ATTR static uint32_t s_next_sequence = 1;
 
@@ -383,7 +370,8 @@ static bool rmds_network_send_local_data(void)
     pkt.sensor_crc_inv = sample.sensor_crc_inv;
 
     ESP_LOGI(NETWORK_TAG,
-             "Sending local data seq=%" PRIu32 " parent=%u conc=%" PRIu32,
+             "LOCAL SEND node=%u seq=%" PRIu32 " parent=%u conc=%" PRIu32,
+             (unsigned int)s_network_config.node_id,
              pkt.header.sequence,
              (unsigned int)pkt.header.dest_node_id,
              pkt.concentration_ppm);
@@ -483,6 +471,19 @@ static void rmds_network_handle_beacon(const rmds_network_beacon_packet_t *pkt)
         return;
     }
 
+    ESP_LOGI(NETWORK_TAG,
+             "Node %u got beacon from %u cost=%u",
+             (unsigned int)s_network_config.node_id,
+             (unsigned int)pkt->header.sender_node_id,
+             (unsigned int)pkt->route_cost);
+
+    /* Force Node 2 to use Node 1 only */
+    if (s_network_config.node_id == 2) {
+        if (pkt->header.sender_node_id != 1) {
+            return;
+        }
+    }
+
     advertised_cost = (uint8_t)(pkt->route_cost + 1U);
     rmds_network_maybe_update_route(pkt->header.sender_node_id,
                                     advertised_cost,
@@ -528,11 +529,11 @@ static void rmds_network_handle_data(const rmds_network_data_packet_t *pkt)
         return;
     }
 
-    if (!rmds_network_forward_data(pkt)) {
-        rmds_lora_start_listening();
-    } else {
-        rmds_lora_start_listening();
-    }
+    /* Queue forwarded traffic instead of sending immediately */
+    s_pending_forward_pkt = *pkt;
+    s_have_pending_forward = true;
+    rmds_lora_start_listening();
+    return;
 }
 
 static void rmds_network_handle_ack(const rmds_network_ack_packet_t *pkt)
@@ -595,6 +596,49 @@ static void rmds_network_process_incoming_once(int64_t deadline_ms)
     }
 }
 
+static void rmds_network_service_tx(void)
+{
+    if (s_network_config.role == RMDS_NETWORK_ROLE_GATEWAY) {
+        return;
+    }
+
+    if (!rmds_network_have_fresh_route()) {
+        return;
+    }
+
+    if (s_prefer_local_tx) {
+        if (rmds_network_send_local_data()) {
+            s_prefer_local_tx = false;
+            rmds_lora_start_listening();
+            return;
+        }
+
+        if (s_have_pending_forward) {
+            if (rmds_network_forward_data(&s_pending_forward_pkt)) {
+                s_have_pending_forward = false;
+                s_prefer_local_tx = true;
+                rmds_lora_start_listening();
+                return;
+            }
+        }
+    } else {
+        if (s_have_pending_forward) {
+            if (rmds_network_forward_data(&s_pending_forward_pkt)) {
+                s_have_pending_forward = false;
+                s_prefer_local_tx = true;
+                rmds_lora_start_listening();
+                return;
+            }
+        }
+
+        if (rmds_network_send_local_data()) {
+            s_prefer_local_tx = false;
+            rmds_lora_start_listening();
+            return;
+        }
+    }
+}
+
 static void rmds_network_mesh_task(void *pvParameters)
 {
     int64_t next_beacon_ms;
@@ -610,6 +654,8 @@ static void rmds_network_mesh_task(void *pvParameters)
 
     memset(&s_route, 0, sizeof(s_route));
     memset(s_seen, 0, sizeof(s_seen));
+    s_prefer_local_tx = true;
+    s_have_pending_forward = false;
 
     if (s_network_config.role == RMDS_NETWORK_ROLE_GATEWAY) {
         s_route.valid = true;
@@ -640,11 +686,11 @@ static void rmds_network_mesh_task(void *pvParameters)
 
         if (s_network_config.role == RMDS_NETWORK_ROLE_MESH_NODE &&
             now_ms >= next_send_ms) {
-            rmds_network_send_local_data();
-            rmds_lora_start_listening();
+            s_prefer_local_tx = true;
             next_send_ms = now_ms + RMDS_NETWORK_SEND_INTERVAL_MS + (esp_random() % 2000U);
         }
 
+        rmds_network_service_tx();
         rmds_network_process_incoming_once(now_ms + 100);
     }
 }

@@ -30,8 +30,8 @@
  *
  * All nodes should use the same gateway ID.
  */
-#define RMDS_APP_NODE_ROLE    RMDS_NETWORK_ROLE_GATEWAY
-#define RMDS_APP_NODE_ID      0
+#define RMDS_APP_NODE_ROLE    RMDS_NETWORK_ROLE_MESH_NODE
+#define RMDS_APP_NODE_ID      1
 #define RMDS_APP_GATEWAY_ID   0
 
 // UART configuration (UART1 on GPIO 14/25) for methane sensor nodes.
