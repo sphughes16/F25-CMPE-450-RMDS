@@ -15,29 +15,70 @@
 #include "power.h"
 #include "rmds_network.h"
 #include "rmds_wifi.h"
+#include "rmds_lora.h"
+#include "esp_random.h"
+#include <string.h>
 
 #define APP_TAG  "RMDS_APP"
 #define TAG_UART "UART_RX"
 
 /*
- * Flash gateway with:
- *   RMDS_APP_NODE_ROLE = RMDS_NETWORK_ROLE_GATEWAY
- *   RMDS_APP_NODE_ID   = 0
+ * ---------------------------------------------------------------------------
+ * MANUAL ROLE / NODE CONFIGURATION
+ * ---------------------------------------------------------------------------
  *
- * Flash mesh nodes with:
- *   RMDS_APP_NODE_ROLE = RMDS_NETWORK_ROLE_MESH_NODE
- *   RMDS_APP_NODE_ID   = unique nonzero ID
+ * Gateway build:
+ *   #define RMDS_APP_NODE_ROLE    RMDS_NETWORK_ROLE_GATEWAY
+ *   #define RMDS_APP_NODE_ID      0
+ *   #define RMDS_APP_GATEWAY_ID   0
  *
- * All nodes should use the same gateway ID.
+ * Mesh sensor node build:
+ *   #define RMDS_APP_NODE_ROLE    RMDS_NETWORK_ROLE_MESH_NODE
+ *   #define RMDS_APP_NODE_ID      <nonzero node id>
+ *   #define RMDS_APP_GATEWAY_ID   0
+ *
+ * Dummy data node build:
+ *   Leave the node as RMDS_NETWORK_ROLE_MESH_NODE, set the desired node ID,
+ *   and enable RMDS_APP_ENABLE_DUMMY_LOCAL_SAMPLE below.
+ *
+ * To force a node to route through a specific parent, set
+ * RMDS_APP_PREFERRED_PARENT_NODE_ID to that node ID.
+ *
+ * For example:
+ *   - Gateway ................. node 0, role gateway
+ *   - Real sensor node ........ node 1, role mesh node, preferred parent 0
+ *   - Dummy source node ....... node 2, role mesh node, preferred parent 1
+ *
+ * Comment / uncomment only the values below for each build.
  */
-#define RMDS_APP_NODE_ROLE    RMDS_NETWORK_ROLE_GATEWAY
-#define RMDS_APP_NODE_ID      0
+#define RMDS_APP_NODE_ROLE    RMDS_NETWORK_ROLE_MESH_NODE
+#define RMDS_APP_NODE_ID      2
 #define RMDS_APP_GATEWAY_ID   0
+
+/*
+ * Dummy-sample generation is now compatible with the mesh network layer.
+ * Leave this set to 1 only on the node that should generate fake sensor data.
+ * Set to 0 on real sensor nodes so UART data is used instead.
+ */
+#if RMDS_APP_NODE_ID == 2
+#define RMDS_APP_ENABLE_DUMMY_LOCAL_SAMPLE 1
+#define RMDS_APP_PREFERRED_PARENT_NODE_ID  1
+#else
+#define RMDS_APP_ENABLE_DUMMY_LOCAL_SAMPLE 0
+#define RMDS_APP_PREFERRED_PARENT_NODE_ID  1
+#endif
+
+/*
+ * Dummy sample update rate.
+ * This only updates the local sample in the network layer.
+ * Actual LoRa send timing is still controlled in rmds_network.c.
+ */
+#define RMDS_APP_DUMMY_SAMPLE_INTERVAL_MS 1000
 
 // UART configuration (UART1 on GPIO 14/25) for methane sensor nodes.
 #define SENSOR_UART_NUM   UART_NUM_1
-#define SENSOR_TX_PIN     GPIO_NUM_14
-#define SENSOR_RX_PIN     GPIO_NUM_25
+#define SENSOR_TX_PIN     GPIO_NUM_14 // Methane sensor TX pin goes to MCU pin 25
+#define SENSOR_RX_PIN     GPIO_NUM_25 // Methane sensor RX pin goes to MCU pin 14
 #define SENSOR_BAUD_RATE  38400
 #define SENSOR_RX_BUF_SZ  2048
 
@@ -55,6 +96,7 @@ static const rmds_network_config_t s_network_config = {
     .role = RMDS_APP_NODE_ROLE,
     .node_id = RMDS_APP_NODE_ID,
     .gateway_node_id = RMDS_APP_GATEWAY_ID,
+    .preferred_parent_node_id = RMDS_APP_PREFERRED_PARENT_NODE_ID,
 };
 
 static uint32_t parse_hex32(const char *s)
@@ -218,20 +260,80 @@ static void init_uart_sensor(void)
              SENSOR_RX_PIN);
 }
 
+#if RMDS_APP_ENABLE_DUMMY_LOCAL_SAMPLE
+
+static void dummy_sample_task(void *pvParameters)
+{
+    uint32_t seq = 1;
+
+    (void)pvParameters;
+    ESP_LOGI(APP_TAG, "Dummy sample task started (%d ms updates)",
+             RMDS_APP_DUMMY_SAMPLE_INTERVAL_MS);
+
+    for (;;) {
+        rmds_network_sensor_sample_t sample = {
+            .concentration_ppm = 400 + (esp_random() % 100),
+            .faults = 0,
+            .temp_deci_kelvin = 2930 + (esp_random() % 50),
+            .sensor_crc = esp_random(),
+            .valid = true,
+        };
+
+        sample.sensor_crc_inv = ~sample.sensor_crc;
+
+        if (rmds_network_update_local_sample(&sample)) {
+            ESP_LOGI(APP_TAG,
+                     "Dummy sample updated: node=%u sample_seq=%" PRIu32 " conc=%" PRIu32,
+                     (unsigned int)RMDS_APP_NODE_ID,
+                     seq++,
+                     sample.concentration_ppm);
+        } else {
+            ESP_LOGW(APP_TAG, "Failed to update dummy sample");
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(RMDS_APP_DUMMY_SAMPLE_INTERVAL_MS));
+    }
+
+    vTaskDelete(NULL);
+}
+
+#endif /* RMDS_APP_ENABLE_DUMMY_LOCAL_SAMPLE */
+
 void app_main(void)
 {
     check_wake_reason();
 
     ESP_LOGI(APP_TAG,
-             "Booting role=%s node=%u gateway=%u",
+             "Booting role=%s node=%u gateway=%u preferred_parent=%u",
              rmds_network_role_to_string(s_network_config.role),
              (unsigned int)s_network_config.node_id,
-             (unsigned int)s_network_config.gateway_node_id);
+             (unsigned int)s_network_config.gateway_node_id,
+             (unsigned int)s_network_config.preferred_parent_node_id);
 
     if (s_network_config.role == RMDS_NETWORK_ROLE_GATEWAY) {
         ESP_LOGI(APP_TAG, "Starting always-on mesh gateway");
         rmds_wifi_init();
     } else {
+#if RMDS_APP_ENABLE_DUMMY_LOCAL_SAMPLE
+        /*
+         * Dummy source node:
+         * leave this block enabled and leave the UART block below disabled.
+         */
+        ESP_LOGI(APP_TAG, "Starting dummy mesh source node");
+        if (xTaskCreate(dummy_sample_task,
+                        "dummy_sample_task",
+                        4096,
+                        NULL,
+                        5,
+                        NULL) != pdPASS) {
+            ESP_LOGE(APP_TAG, "Failed to create dummy sample task");
+            return;
+        }
+#else
+        /*
+         * Real sensor node:
+         * leave this UART block enabled and keep the dummy block above disabled.
+         */
         ESP_LOGI(APP_TAG, "Starting mesh sensor node");
         init_uart_sensor();
 
@@ -244,6 +346,7 @@ void app_main(void)
             ESP_LOGE(APP_TAG, "Failed to create UART RX task");
             return;
         }
+#endif /* RMDS_APP_ENABLE_DUMMY_LOCAL_SAMPLE */
     }
 
     if (!rmds_network_start(&s_network_config)) {

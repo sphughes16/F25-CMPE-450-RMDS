@@ -7,6 +7,8 @@ extern "C" {
 #include <stdbool.h>
 #include <stdint.h>
 
+#define RMDS_NETWORK_NO_PARENT_PREFERENCE 0xFFu
+
 typedef enum {
     RMDS_NETWORK_ROLE_MESH_NODE = 0,
     RMDS_NETWORK_ROLE_GATEWAY   = 1,
@@ -25,6 +27,15 @@ typedef struct {
     rmds_network_role_t role;
     uint8_t node_id;
     uint8_t gateway_node_id;
+
+    /*
+     * Optional next-hop restriction.
+     *
+     * Set this to a specific node ID to force this node to route through that
+     * parent only. Set to RMDS_NETWORK_NO_PARENT_PREFERENCE to allow normal
+     * best-route selection.
+     */
+    uint8_t preferred_parent_node_id;
 } rmds_network_config_t;
 
 bool rmds_network_start(const rmds_network_config_t *config);

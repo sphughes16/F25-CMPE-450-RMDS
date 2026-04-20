@@ -28,7 +28,8 @@
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 
-#define RMDS_WIFI_CLOUD_QUEUE_LEN 16
+#define RMDS_WIFI_CLOUD_QUEUE_LEN 64
+#define RMDS_WIFI_RETRY_DELAY_MS  2000
 
 static EventGroupHandle_t s_wifi_event_group;
 static QueueHandle_t s_cloud_queue;
@@ -96,16 +97,17 @@ static esp_err_t rmds_wifi_http_event_handler(esp_http_client_event_t *evt)
     return ESP_OK;
 }
 
-static void rmds_wifi_send_frame_to_cloud(const rmds_wifi_cloud_frame_t *frame)
+static bool rmds_wifi_send_frame_to_cloud(const rmds_wifi_cloud_frame_t *frame)
 {
     char json_body[512];
     int written;
     esp_http_client_config_t config;
     esp_http_client_handle_t client;
     esp_err_t err;
+    bool success = false;
 
     if (frame == NULL) {
-        return;
+        return false;
     }
 
     written = snprintf(
@@ -134,7 +136,7 @@ static void rmds_wifi_send_frame_to_cloud(const rmds_wifi_cloud_frame_t *frame)
 
     if (written <= 0 || written >= (int)sizeof(json_body)) {
         ESP_LOGE(WIFI_TAG, "JSON body too long or error");
-        return;
+        return false;
     }
 
     memset(&config, 0, sizeof(config));
@@ -147,7 +149,7 @@ static void rmds_wifi_send_frame_to_cloud(const rmds_wifi_cloud_frame_t *frame)
     client = esp_http_client_init(&config);
     if (client == NULL) {
         ESP_LOGE(WIFI_TAG, "Failed to init HTTP client");
-        return;
+        return false;
     }
 
     esp_http_client_set_header(client, "Content-Type", "application/json");
@@ -163,6 +165,7 @@ static void rmds_wifi_send_frame_to_cloud(const rmds_wifi_cloud_frame_t *frame)
         ESP_LOGI(WIFI_TAG, "HTTP POST status = %d", status);
         if (status == 200 || status == 302) {
             ESP_LOGI(WIFI_TAG, "Data logged to Google Sheets successfully");
+            success = true;
         } else {
             ESP_LOGW(WIFI_TAG, "Unexpected status code: %d", status);
         }
@@ -171,6 +174,7 @@ static void rmds_wifi_send_frame_to_cloud(const rmds_wifi_cloud_frame_t *frame)
     }
 
     esp_http_client_cleanup(client);
+    return success;
 }
 
 static void rmds_wifi_cloud_task(void *pvParameters)
@@ -186,12 +190,22 @@ static void rmds_wifi_cloud_task(void *pvParameters)
 
         if (!s_wifi_ready) {
             ESP_LOGW(WIFI_TAG,
-                     "Dropping frame seq=%" PRIu32 " because Wi-Fi is not ready",
+                     "Wi-Fi not ready; retrying frame node=%u seq=%" PRIu32,
+                     (unsigned int)frame.node_id,
                      frame.network_seq);
+            vTaskDelay(pdMS_TO_TICKS(RMDS_WIFI_RETRY_DELAY_MS));
+            xQueueSendToFront(s_cloud_queue, &frame, pdMS_TO_TICKS(100));
             continue;
         }
 
-        rmds_wifi_send_frame_to_cloud(&frame);
+        if (!rmds_wifi_send_frame_to_cloud(&frame)) {
+            ESP_LOGW(WIFI_TAG,
+                     "Cloud send failed; requeueing node=%u seq=%" PRIu32,
+                     (unsigned int)frame.node_id,
+                     frame.network_seq);
+            vTaskDelay(pdMS_TO_TICKS(RMDS_WIFI_RETRY_DELAY_MS));
+            xQueueSendToFront(s_cloud_queue, &frame, pdMS_TO_TICKS(100));
+        }
     }
 }
 

@@ -27,27 +27,11 @@
 
 #define RMDS_NETWORK_MAX_SEEN_PACKETS      32
 #define RMDS_NETWORK_MAX_HOPS              8
-#define RMDS_NETWORK_BEACON_INTERVAL_MS    4000
-#define RMDS_NETWORK_ROUTE_STALE_MS        15000
+#define RMDS_NETWORK_BEACON_INTERVAL_MS    2000
+#define RMDS_NETWORK_ROUTE_STALE_MS        60000
 #define RMDS_NETWORK_FORWARD_DELAY_MS      25
-#define RMDS_NETWORK_SEND_INTERVAL_MS      5000
-
-/*
- * IMPORTANT:
- * This file assumes your header supports two roles:
- *
- *   RMDS_NETWORK_ROLE_GATEWAY
- *   RMDS_NETWORK_ROLE_MESH_NODE
- *
- * and that config has:
- *
- *   role
- *   node_id
- *   gateway_node_id
- *   sleep_duration_s   (optional, not used here)
- *
- * If your current header still uses MASTER/SENSOR, update it first.
- */
+#define RMDS_NETWORK_SEND_INTERVAL_MS      15000
+#define RMDS_NETWORK_FORWARD_QUEUE_LEN     8
 
 typedef enum {
     RMDS_NETWORK_PKT_BEACON = 1,
@@ -58,10 +42,10 @@ typedef enum {
 typedef struct __attribute__((packed)) {
     uint8_t version;
     uint8_t type;
-    uint8_t origin_node_id;   /* who originally created this packet */
-    uint8_t sender_node_id;   /* who transmitted this copy */
-    uint8_t dest_node_id;     /* next hop or broadcast */
-    uint8_t gateway_node_id;  /* final sink */
+    uint8_t origin_node_id;
+    uint8_t sender_node_id;
+    uint8_t dest_node_id;
+    uint8_t gateway_node_id;
     uint8_t hop_count;
     uint8_t max_hops;
     uint32_t sequence;
@@ -69,7 +53,7 @@ typedef struct __attribute__((packed)) {
 
 typedef struct __attribute__((packed)) {
     rmds_network_header_t header;
-    uint8_t route_cost;       /* cost to gateway; gateway advertises 0 */
+    uint8_t route_cost;
 } rmds_network_beacon_packet_t;
 
 typedef struct __attribute__((packed)) {
@@ -111,6 +95,14 @@ static rmds_network_config_t s_network_config;
 
 static rmds_network_route_t s_route;
 static rmds_network_seen_packet_t s_seen[RMDS_NETWORK_MAX_SEEN_PACKETS];
+
+static bool s_prefer_local_tx = true;
+static bool s_local_send_due = false;
+
+static rmds_network_data_packet_t s_forward_queue[RMDS_NETWORK_FORWARD_QUEUE_LEN];
+static size_t s_forward_queue_head = 0;
+static size_t s_forward_queue_tail = 0;
+static size_t s_forward_queue_count = 0;
 
 RTC_DATA_ATTR static uint32_t s_next_sequence = 1;
 
@@ -275,9 +267,19 @@ static void rmds_network_maybe_update_route(uint8_t parent_node_id,
                                             int rssi_dbm)
 {
     bool better = false;
+    bool same_parent = false;
 
     if (parent_node_id == s_network_config.node_id) {
         return;
+    }
+
+    if (s_network_config.preferred_parent_node_id != RMDS_NETWORK_NO_PARENT_PREFERENCE &&
+        parent_node_id != s_network_config.preferred_parent_node_id) {
+        return;
+    }
+
+    if (s_route.valid && parent_node_id == s_route.parent_node_id) {
+        same_parent = true;
     }
 
     if (!s_route.valid) {
@@ -288,18 +290,25 @@ static void rmds_network_maybe_update_route(uint8_t parent_node_id,
         better = true;
     }
 
-    if (better) {
+    if (better || same_parent) {
+        bool changed = (!s_route.valid) ||
+                       (s_route.parent_node_id != parent_node_id) ||
+                       (s_route.route_cost != route_cost) ||
+                       (s_route.rssi_dbm != rssi_dbm);
+
         s_route.valid = true;
         s_route.parent_node_id = parent_node_id;
         s_route.route_cost = route_cost;
         s_route.rssi_dbm = rssi_dbm;
         s_route.last_update_ms = rmds_network_now_ms();
 
-        ESP_LOGI(NETWORK_TAG,
-                 "Route updated: parent=%u cost=%u rssi=%d",
-                 (unsigned int)s_route.parent_node_id,
-                 (unsigned int)s_route.route_cost,
-                 s_route.rssi_dbm);
+        if (changed) {
+            ESP_LOGI(NETWORK_TAG,
+                     "Route updated: parent=%u cost=%u rssi=%d",
+                     (unsigned int)s_route.parent_node_id,
+                     (unsigned int)s_route.route_cost,
+                     s_route.rssi_dbm);
+        }
     }
 }
 
@@ -357,12 +366,10 @@ static bool rmds_network_send_local_data(void)
     }
 
     if (!rmds_network_have_fresh_route()) {
-        ESP_LOGW(NETWORK_TAG, "No route to gateway; local data not sent");
         return false;
     }
 
     if (!rmds_network_copy_latest_sample(&sample)) {
-        ESP_LOGW(NETWORK_TAG, "No valid local sensor sample");
         return false;
     }
 
@@ -383,7 +390,8 @@ static bool rmds_network_send_local_data(void)
     pkt.sensor_crc_inv = sample.sensor_crc_inv;
 
     ESP_LOGI(NETWORK_TAG,
-             "Sending local data seq=%" PRIu32 " parent=%u conc=%" PRIu32,
+             "LOCAL SEND node=%u seq=%" PRIu32 " next_hop=%u conc=%" PRIu32,
+             (unsigned int)s_network_config.node_id,
              pkt.header.sequence,
              (unsigned int)pkt.header.dest_node_id,
              pkt.concentration_ppm);
@@ -423,13 +431,53 @@ static bool rmds_network_forward_data(const rmds_network_data_packet_t *incoming
     vTaskDelay(pdMS_TO_TICKS(RMDS_NETWORK_FORWARD_DELAY_MS + (esp_random() % 20U)));
 
     ESP_LOGI(NETWORK_TAG,
-             "Forwarding origin=%u seq=%" PRIu32 " via parent=%u hop=%u",
+             "FORWARD origin=%u seq=%" PRIu32 " next_hop=%u hop=%u",
              (unsigned int)pkt.header.origin_node_id,
              pkt.header.sequence,
              (unsigned int)pkt.header.dest_node_id,
              (unsigned int)pkt.header.hop_count);
 
     return rmds_lora_send(&pkt, sizeof(pkt));
+}
+
+static bool rmds_network_forward_queue_push(const rmds_network_data_packet_t *pkt)
+{
+    if (pkt == NULL) {
+        return false;
+    }
+
+    if (s_forward_queue_count >= RMDS_NETWORK_FORWARD_QUEUE_LEN) {
+        ESP_LOGW(NETWORK_TAG,
+                 "Forward queue full; dropping origin=%u seq=%" PRIu32,
+                 (unsigned int)pkt->header.origin_node_id,
+                 pkt->header.sequence);
+        return false;
+    }
+
+    s_forward_queue[s_forward_queue_tail] = *pkt;
+    s_forward_queue_tail = (s_forward_queue_tail + 1U) % RMDS_NETWORK_FORWARD_QUEUE_LEN;
+    s_forward_queue_count++;
+    return true;
+}
+
+static bool rmds_network_forward_queue_peek(rmds_network_data_packet_t *pkt)
+{
+    if (pkt == NULL || s_forward_queue_count == 0) {
+        return false;
+    }
+
+    *pkt = s_forward_queue[s_forward_queue_head];
+    return true;
+}
+
+static void rmds_network_forward_queue_pop(void)
+{
+    if (s_forward_queue_count == 0) {
+        return;
+    }
+
+    s_forward_queue_head = (s_forward_queue_head + 1U) % RMDS_NETWORK_FORWARD_QUEUE_LEN;
+    s_forward_queue_count--;
 }
 
 static void rmds_network_gateway_consume_data(const rmds_network_data_packet_t *pkt,
@@ -450,9 +498,10 @@ static void rmds_network_gateway_consume_data(const rmds_network_data_packet_t *
     frame.snr_db = snr_db;
 
     ESP_LOGI(NETWORK_TAG,
-             "Gateway received data origin=%u seq=%" PRIu32 " conc=%" PRIu32,
+             "Gateway received routed data origin=%u seq=%" PRIu32 " sender=%u conc=%" PRIu32,
              (unsigned int)pkt->header.origin_node_id,
              pkt->header.sequence,
+             (unsigned int)pkt->header.sender_node_id,
              pkt->concentration_ppm);
 
     if (!rmds_wifi_enqueue_frame(&frame)) {
@@ -483,6 +532,17 @@ static void rmds_network_handle_beacon(const rmds_network_beacon_packet_t *pkt)
         return;
     }
 
+    if (s_network_config.preferred_parent_node_id != RMDS_NETWORK_NO_PARENT_PREFERENCE &&
+        pkt->header.sender_node_id != s_network_config.preferred_parent_node_id) {
+        return;
+    }
+
+    ESP_LOGI(NETWORK_TAG,
+             "Node %u got beacon from %u cost=%u",
+             (unsigned int)s_network_config.node_id,
+             (unsigned int)pkt->header.sender_node_id,
+             (unsigned int)pkt->route_cost);
+
     advertised_cost = (uint8_t)(pkt->route_cost + 1U);
     rmds_network_maybe_update_route(pkt->header.sender_node_id,
                                     advertised_cost,
@@ -502,6 +562,27 @@ static void rmds_network_handle_data(const rmds_network_data_packet_t *pkt)
     }
 
     if (pkt->header.origin_node_id == s_network_config.node_id) {
+        return;
+    }
+
+    if (pkt->header.dest_node_id == RMDS_NETWORK_BROADCAST_NODE) {
+        ESP_LOGW(NETWORK_TAG,
+                 "Ignoring legacy broadcast data origin=%u seq=%" PRIu32,
+                 (unsigned int)pkt->header.origin_node_id,
+                 pkt->header.sequence);
+        return;
+    }
+
+    if (pkt->header.dest_node_id != s_network_config.node_id) {
+        if (s_network_config.role == RMDS_NETWORK_ROLE_GATEWAY) {
+            ESP_LOGI(NETWORK_TAG,
+                     "Gateway overheard transit packet origin=%u seq=%" PRIu32
+                     " sender=%u next_hop=%u; waiting for forward",
+                     (unsigned int)pkt->header.origin_node_id,
+                     pkt->header.sequence,
+                     (unsigned int)pkt->header.sender_node_id,
+                     (unsigned int)pkt->header.dest_node_id);
+        }
         return;
     }
 
@@ -528,11 +609,14 @@ static void rmds_network_handle_data(const rmds_network_data_packet_t *pkt)
         return;
     }
 
-    if (!rmds_network_forward_data(pkt)) {
-        rmds_lora_start_listening();
-    } else {
-        rmds_lora_start_listening();
+    if (!rmds_network_forward_queue_push(pkt)) {
+        ESP_LOGW(NETWORK_TAG,
+                 "Forward queue enqueue failed for origin=%u seq=%" PRIu32,
+                 (unsigned int)pkt->header.origin_node_id,
+                 pkt->header.sequence);
     }
+
+    rmds_lora_start_listening();
 }
 
 static void rmds_network_handle_ack(const rmds_network_ack_packet_t *pkt)
@@ -595,6 +679,58 @@ static void rmds_network_process_incoming_once(int64_t deadline_ms)
     }
 }
 
+static void rmds_network_service_tx(void)
+{
+    bool local_available;
+    bool forward_available;
+    rmds_network_data_packet_t forward_pkt;
+
+    if (s_network_config.role == RMDS_NETWORK_ROLE_GATEWAY) {
+        return;
+    }
+
+    if (!rmds_network_have_fresh_route()) {
+        return;
+    }
+
+    local_available = s_local_send_due;
+    forward_available = rmds_network_forward_queue_peek(&forward_pkt);
+
+    if (!local_available && !forward_available) {
+        return;
+    }
+
+    if (s_prefer_local_tx) {
+        if (local_available && rmds_network_send_local_data()) {
+            s_local_send_due = false;
+            s_prefer_local_tx = false;
+            rmds_lora_start_listening();
+            return;
+        }
+
+        if (forward_available && rmds_network_forward_data(&forward_pkt)) {
+            rmds_network_forward_queue_pop();
+            s_prefer_local_tx = true;
+            rmds_lora_start_listening();
+            return;
+        }
+    } else {
+        if (forward_available && rmds_network_forward_data(&forward_pkt)) {
+            rmds_network_forward_queue_pop();
+            s_prefer_local_tx = true;
+            rmds_lora_start_listening();
+            return;
+        }
+
+        if (local_available && rmds_network_send_local_data()) {
+            s_local_send_due = false;
+            s_prefer_local_tx = false;
+            rmds_lora_start_listening();
+            return;
+        }
+    }
+}
+
 static void rmds_network_mesh_task(void *pvParameters)
 {
     int64_t next_beacon_ms;
@@ -610,6 +746,12 @@ static void rmds_network_mesh_task(void *pvParameters)
 
     memset(&s_route, 0, sizeof(s_route));
     memset(s_seen, 0, sizeof(s_seen));
+    memset(s_forward_queue, 0, sizeof(s_forward_queue));
+    s_forward_queue_head = 0;
+    s_forward_queue_tail = 0;
+    s_forward_queue_count = 0;
+    s_prefer_local_tx = true;
+    s_local_send_due = false;
 
     if (s_network_config.role == RMDS_NETWORK_ROLE_GATEWAY) {
         s_route.valid = true;
@@ -640,11 +782,12 @@ static void rmds_network_mesh_task(void *pvParameters)
 
         if (s_network_config.role == RMDS_NETWORK_ROLE_MESH_NODE &&
             now_ms >= next_send_ms) {
-            rmds_network_send_local_data();
-            rmds_lora_start_listening();
+            s_local_send_due = true;
+            s_prefer_local_tx = true;
             next_send_ms = now_ms + RMDS_NETWORK_SEND_INTERVAL_MS + (esp_random() % 2000U);
         }
 
+        rmds_network_service_tx();
         rmds_network_process_incoming_once(now_ms + 100);
     }
 }
@@ -678,10 +821,11 @@ bool rmds_network_start(const rmds_network_config_t *config)
 
     s_network_started = true;
     ESP_LOGI(NETWORK_TAG,
-             "Started mesh role=%s node=%u gateway=%u",
+             "Started mesh role=%s node=%u gateway=%u preferred_parent=%u",
              rmds_network_role_to_string(config->role),
              (unsigned int)config->node_id,
-             (unsigned int)config->gateway_node_id);
+             (unsigned int)config->gateway_node_id,
+             (unsigned int)config->preferred_parent_node_id);
     return true;
 }
 
