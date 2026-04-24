@@ -28,7 +28,7 @@
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 
-#define RMDS_WIFI_CLOUD_QUEUE_LEN 64
+#define RMDS_WIFI_CLOUD_QUEUE_LEN 128
 #define RMDS_WIFI_RETRY_DELAY_MS  2000
 
 static EventGroupHandle_t s_wifi_event_group;
@@ -144,7 +144,7 @@ static bool rmds_wifi_send_frame_to_cloud(const rmds_wifi_cloud_frame_t *frame)
     config.method = HTTP_METHOD_POST;
     config.event_handler = rmds_wifi_http_event_handler;
     config.timeout_ms = 20000;
-    config.keep_alive_enable = true;
+    config.keep_alive_enable = false;
 
     client = esp_http_client_init(&config);
     if (client == NULL) {
@@ -163,7 +163,7 @@ static bool rmds_wifi_send_frame_to_cloud(const rmds_wifi_cloud_frame_t *frame)
         int status = esp_http_client_get_status_code(client);
 
         ESP_LOGI(WIFI_TAG, "HTTP POST status = %d", status);
-        if (status == 200 || status == 302) {
+        if (status == 200) {
             ESP_LOGI(WIFI_TAG, "Data logged to Google Sheets successfully");
             success = true;
         } else {
@@ -190,21 +190,17 @@ static void rmds_wifi_cloud_task(void *pvParameters)
 
         if (!s_wifi_ready) {
             ESP_LOGW(WIFI_TAG,
-                     "Wi-Fi not ready; retrying frame node=%u seq=%" PRIu32,
+                     "Wi-Fi not ready; dropping frame node=%u seq=%" PRIu32,
                      (unsigned int)frame.node_id,
                      frame.network_seq);
-            vTaskDelay(pdMS_TO_TICKS(RMDS_WIFI_RETRY_DELAY_MS));
-            xQueueSendToFront(s_cloud_queue, &frame, pdMS_TO_TICKS(100));
             continue;
         }
 
         if (!rmds_wifi_send_frame_to_cloud(&frame)) {
             ESP_LOGW(WIFI_TAG,
-                     "Cloud send failed; requeueing node=%u seq=%" PRIu32,
+                     "Cloud send failed; dropping node=%u seq=%" PRIu32,
                      (unsigned int)frame.node_id,
                      frame.network_seq);
-            vTaskDelay(pdMS_TO_TICKS(RMDS_WIFI_RETRY_DELAY_MS));
-            xQueueSendToFront(s_cloud_queue, &frame, pdMS_TO_TICKS(100));
         }
     }
 }
