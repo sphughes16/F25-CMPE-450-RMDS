@@ -52,7 +52,7 @@
  * Comment / uncomment only the values below for each build.
  */
 #define RMDS_APP_NODE_ROLE    RMDS_NETWORK_ROLE_MESH_NODE
-#define RMDS_APP_NODE_ID      2
+#define RMDS_APP_NODE_ID      1
 #define RMDS_APP_GATEWAY_ID   0
 
 /*
@@ -60,13 +60,13 @@
  * Leave this set to 1 only on the node that should generate fake sensor data.
  * Set to 0 on real sensor nodes so UART data is used instead.
  */
-#if RMDS_APP_NODE_ID == 2
+#if RMDS_APP_NODE_ROLE == RMDS_NETWORK_ROLE_MESH_NODE && RMDS_APP_NODE_ID != 1
 #define RMDS_APP_ENABLE_DUMMY_LOCAL_SAMPLE 1
-#define RMDS_APP_PREFERRED_PARENT_NODE_ID  1
 #else
 #define RMDS_APP_ENABLE_DUMMY_LOCAL_SAMPLE 0
-#define RMDS_APP_PREFERRED_PARENT_NODE_ID  RMDS_NETWORK_NO_PARENT_PREFERENCE
 #endif
+
+#define RMDS_APP_PREFERRED_PARENT_NODE_ID  RMDS_NETWORK_NO_PARENT_PREFERENCE
 
 /*
  * Dummy sample update rate.
