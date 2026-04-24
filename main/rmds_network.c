@@ -25,13 +25,13 @@
 #define RMDS_NETWORK_TASK_STACK            8192
 #define RMDS_NETWORK_POLL_MS               10
 
-#define RMDS_NETWORK_MAX_SEEN_PACKETS      32
+#define RMDS_NETWORK_MAX_SEEN_PACKETS      128
 #define RMDS_NETWORK_MAX_HOPS              8
 #define RMDS_NETWORK_BEACON_INTERVAL_MS    2000
 #define RMDS_NETWORK_ROUTE_STALE_MS        60000
-#define RMDS_NETWORK_FORWARD_DELAY_MS      25
-#define RMDS_NETWORK_SEND_INTERVAL_MS      15000
-#define RMDS_NETWORK_FORWARD_QUEUE_LEN     8
+#define RMDS_NETWORK_FORWARD_DELAY_MS      50
+#define RMDS_NETWORK_SEND_INTERVAL_MS      10000
+#define RMDS_NETWORK_FORWARD_QUEUE_LEN     32
 
 typedef enum {
     RMDS_NETWORK_PKT_BEACON = 1,
@@ -365,10 +365,6 @@ static bool rmds_network_send_local_data(void)
         return false;
     }
 
-    if (!rmds_network_have_fresh_route()) {
-        return false;
-    }
-
     if (!rmds_network_copy_latest_sample(&sample)) {
         return false;
     }
@@ -377,7 +373,7 @@ static bool rmds_network_send_local_data(void)
                              RMDS_NETWORK_PKT_DATA,
                              s_network_config.node_id,
                              s_network_config.node_id,
-                             s_route.parent_node_id,
+                             RMDS_NETWORK_BROADCAST_NODE,
                              s_network_config.gateway_node_id,
                              0,
                              RMDS_NETWORK_MAX_HOPS,
@@ -389,11 +385,14 @@ static bool rmds_network_send_local_data(void)
     pkt.sensor_crc = sample.sensor_crc;
     pkt.sensor_crc_inv = sample.sensor_crc_inv;
 
+    /* Mark our own packet as seen so we do not forward it back if we hear it later. */
+    rmds_network_seen_expire_old();
+    rmds_network_seen_add(pkt.header.origin_node_id, pkt.header.sequence);
+
     ESP_LOGI(NETWORK_TAG,
-             "LOCAL SEND node=%u seq=%" PRIu32 " next_hop=%u conc=%" PRIu32,
+             "LOCAL BROADCAST node=%u seq=%" PRIu32 " conc=%" PRIu32,
              (unsigned int)s_network_config.node_id,
              pkt.header.sequence,
-             (unsigned int)pkt.header.dest_node_id,
              pkt.concentration_ppm);
 
     return rmds_lora_send(&pkt, sizeof(pkt));
@@ -407,14 +406,6 @@ static bool rmds_network_forward_data(const rmds_network_data_packet_t *incoming
         return false;
     }
 
-    if (!rmds_network_have_fresh_route()) {
-        ESP_LOGW(NETWORK_TAG,
-                 "No route available to forward origin=%u seq=%" PRIu32,
-                 (unsigned int)incoming->header.origin_node_id,
-                 incoming->header.sequence);
-        return false;
-    }
-
     if (incoming->header.hop_count >= incoming->header.max_hops) {
         ESP_LOGW(NETWORK_TAG,
                  "Hop limit reached for origin=%u seq=%" PRIu32,
@@ -425,16 +416,17 @@ static bool rmds_network_forward_data(const rmds_network_data_packet_t *incoming
 
     pkt = *incoming;
     pkt.header.sender_node_id = s_network_config.node_id;
-    pkt.header.dest_node_id = s_route.parent_node_id;
+    pkt.header.dest_node_id = RMDS_NETWORK_BROADCAST_NODE;
     pkt.header.hop_count++;
 
-    vTaskDelay(pdMS_TO_TICKS(RMDS_NETWORK_FORWARD_DELAY_MS + (esp_random() % 20U)));
+    /* Random delay keeps all nodes from rebroadcasting at exactly the same time. */
+    vTaskDelay(pdMS_TO_TICKS(RMDS_NETWORK_FORWARD_DELAY_MS + (esp_random() % 150U)));
 
     ESP_LOGI(NETWORK_TAG,
-             "FORWARD origin=%u seq=%" PRIu32 " next_hop=%u hop=%u",
+             "FLOOD FORWARD origin=%u seq=%" PRIu32 " sender=%u hop=%u",
              (unsigned int)pkt.header.origin_node_id,
              pkt.header.sequence,
-             (unsigned int)pkt.header.dest_node_id,
+             (unsigned int)pkt.header.sender_node_id,
              (unsigned int)pkt.header.hop_count);
 
     return rmds_lora_send(&pkt, sizeof(pkt));
@@ -565,46 +557,35 @@ static void rmds_network_handle_data(const rmds_network_data_packet_t *pkt)
         return;
     }
 
-    if (pkt->header.dest_node_id == RMDS_NETWORK_BROADCAST_NODE) {
-        ESP_LOGW(NETWORK_TAG,
-                 "Ignoring legacy broadcast data origin=%u seq=%" PRIu32,
-                 (unsigned int)pkt->header.origin_node_id,
-                 pkt->header.sequence);
-        return;
-    }
-
-    if (pkt->header.dest_node_id != s_network_config.node_id) {
-        if (s_network_config.role == RMDS_NETWORK_ROLE_GATEWAY) {
-            ESP_LOGI(NETWORK_TAG,
-                     "Gateway overheard transit packet origin=%u seq=%" PRIu32
-                     " sender=%u next_hop=%u; waiting for forward",
-                     (unsigned int)pkt->header.origin_node_id,
-                     pkt->header.sequence,
-                     (unsigned int)pkt->header.sender_node_id,
-                     (unsigned int)pkt->header.dest_node_id);
-        }
-        return;
-    }
-
     rmds_network_seen_expire_old();
-    duplicate = rmds_network_seen_contains(pkt->header.origin_node_id, pkt->header.sequence);
+    duplicate = rmds_network_seen_contains(pkt->header.origin_node_id,
+                                           pkt->header.sequence);
     if (duplicate) {
         ESP_LOGI(NETWORK_TAG,
                  "Duplicate dropped origin=%u seq=%" PRIu32,
                  (unsigned int)pkt->header.origin_node_id,
                  pkt->header.sequence);
+        rmds_lora_start_listening();
         return;
     }
 
-    rmds_network_seen_add(pkt->header.origin_node_id, pkt->header.sequence);
+    /* First time this node has seen this origin+sequence. */
+    rmds_network_seen_add(pkt->header.origin_node_id,
+                          pkt->header.sequence);
 
     if (s_network_config.role == RMDS_NETWORK_ROLE_GATEWAY) {
         rmds_network_gateway_consume_data(pkt,
                                           rmds_lora_last_packet_rssi(),
                                           rmds_lora_last_packet_snr());
-        rmds_network_send_ack(pkt->header.origin_node_id,
-                              pkt->header.sender_node_id,
-                              pkt->header.sequence);
+        rmds_lora_start_listening();
+        return;
+    }
+
+    if (pkt->header.hop_count >= pkt->header.max_hops) {
+        ESP_LOGW(NETWORK_TAG,
+                 "Not forwarding, max hops reached origin=%u seq=%" PRIu32,
+                 (unsigned int)pkt->header.origin_node_id,
+                 pkt->header.sequence);
         rmds_lora_start_listening();
         return;
     }
@@ -689,10 +670,6 @@ static void rmds_network_service_tx(void)
         return;
     }
 
-    if (!rmds_network_have_fresh_route()) {
-        return;
-    }
-
     local_available = s_local_send_due;
     forward_available = rmds_network_forward_queue_peek(&forward_pkt);
 
@@ -762,7 +739,7 @@ static void rmds_network_mesh_task(void *pvParameters)
     }
 
     next_beacon_ms = rmds_network_now_ms() + 500;
-    next_send_ms = rmds_network_now_ms() + 3000 + (esp_random() % 1500U);
+    next_send_ms = rmds_network_now_ms() + RMDS_NETWORK_SEND_INTERVAL_MS + (esp_random() % 500U);
 
     rmds_lora_start_listening();
 
@@ -784,7 +761,7 @@ static void rmds_network_mesh_task(void *pvParameters)
             now_ms >= next_send_ms) {
             s_local_send_due = true;
             s_prefer_local_tx = true;
-            next_send_ms = now_ms + RMDS_NETWORK_SEND_INTERVAL_MS + (esp_random() % 2000U);
+            next_send_ms = now_ms + RMDS_NETWORK_SEND_INTERVAL_MS + (esp_random() % 500U);
         }
 
         rmds_network_service_tx();
