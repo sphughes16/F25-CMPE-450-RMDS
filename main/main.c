@@ -1,9 +1,7 @@
-#include <stdio.h>
-#include <string.h>
+#include <inttypes.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
-#include <inttypes.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -15,119 +13,165 @@
 #include "driver/uart.h"
 
 #include "power.h"
-#include "esp_sleep.h"
+#include "rmds_network.h"
+#include "rmds_wifi.h"
+#include "rmds_lora.h"
+#include "esp_random.h"
+#include <string.h>
 
-#include "rmds_lora.h"   // LoRa task interface
-#include "rmds_wifi.h"   // WiFi/cloud interface (used on RX node)
+#define APP_TAG  "RMDS_APP"
+#define TAG_UART "UART_RX"
 
-#define TAG        "RMDS_OLED"
-#define TAG_UART   "UART_RX"
+/*
+ * ---------------------------------------------------------------------------
+ * MANUAL ROLE / NODE CONFIGURATION
+ * ---------------------------------------------------------------------------
+ *
+ * Gateway build:
+ *   #define RMDS_APP_NODE_ROLE    RMDS_NETWORK_ROLE_GATEWAY
+ *   #define RMDS_APP_NODE_ID      0
+ *   #define RMDS_APP_GATEWAY_ID   0
+ *
+ * Mesh sensor node build:
+ *   #define RMDS_APP_NODE_ROLE    RMDS_NETWORK_ROLE_MESH_NODE
+ *   #define RMDS_APP_NODE_ID      <nonzero node id>
+ *   #define RMDS_APP_GATEWAY_ID   0
+ *
+ * Dummy data node build:
+ *   Leave the node as RMDS_NETWORK_ROLE_MESH_NODE, set the desired node ID,
+ *   and enable RMDS_APP_ENABLE_DUMMY_LOCAL_SAMPLE below.
+ *
+ * To force a node to route through a specific parent, set
+ * RMDS_APP_PREFERRED_PARENT_NODE_ID to that node ID.
+ *
+ * For example:
+ *   - Gateway ................. node 0, role gateway
+ *   - Real sensor node ........ node 1, role mesh node, preferred parent 0
+ *   - Dummy source node ....... node 2, role mesh node, preferred parent 1
+ *
+ * Comment / uncomment only the values below for each build.
+ */
+#define RMDS_APP_NODE_ROLE    RMDS_NETWORK_ROLE_MESH_NODE
+#define RMDS_APP_NODE_ID      1
+#define RMDS_APP_GATEWAY_ID   0
 
-//  UART configuration (UART1 on GPIO 14/25) TX node
+/*
+ * Dummy-sample generation is now compatible with the mesh network layer.
+ * Leave this set to 1 only on the node that should generate fake sensor data.
+ * Set to 0 on real sensor nodes so UART data is used instead.
+ */
+#if RMDS_APP_NODE_ROLE == RMDS_NETWORK_ROLE_MESH_NODE && RMDS_APP_NODE_ID != 1
+#define RMDS_APP_ENABLE_DUMMY_LOCAL_SAMPLE 1
+#else
+#define RMDS_APP_ENABLE_DUMMY_LOCAL_SAMPLE 0
+#endif
+
+#define RMDS_APP_PREFERRED_PARENT_NODE_ID  RMDS_NETWORK_NO_PARENT_PREFERENCE
+
+/*
+ * Dummy sample update rate.
+ * This only updates the local sample in the network layer.
+ * Actual LoRa send timing is still controlled in rmds_network.c.
+ */
+#define RMDS_APP_DUMMY_SAMPLE_INTERVAL_MS 1000
+
+// UART configuration (UART1 on GPIO 14/25) for methane sensor nodes.
 #define SENSOR_UART_NUM   UART_NUM_1
-#define SENSOR_TX_PIN     GPIO_NUM_14
-#define SENSOR_RX_PIN     GPIO_NUM_25
+#define SENSOR_TX_PIN     GPIO_NUM_14 // Methane sensor TX pin goes to MCU pin 25
+#define SENSOR_RX_PIN     GPIO_NUM_25 // Methane sensor RX pin goes to MCU pin 14
 #define SENSOR_BAUD_RATE  38400
 #define SENSOR_RX_BUF_SZ  2048
-
-//  typedef struct to hold UART frame
-//
-// Frame layout (NORMAL mode):
-//   1) 0x0000005B   (start, '[')
-//   2) concentration (PPM)        - HEX on wire, we show DECIMAL
-//   3) faults                     - HEX on wire, we show DECIMAL
-//   4) sensor temperature (K*10)  - HEX on wire, we show Kelvin = value/10
-//   5) CRC                        - HEX
-//   6) CRC 1's complement         - HEX, crc ^ crc_1c == 0xFFFFFFFF
-//   7) 0x0000005D   (end, ']')
 
 typedef struct {
     uint32_t start;
     uint32_t conc_ppm;
     uint32_t faults;
-    uint32_t temp_raw;   // Kelvin * 10
+    uint32_t temp_raw;
     uint32_t crc;
     uint32_t crc_inv;
     uint32_t end;
 } sensor_frame_t;
+
+static const rmds_network_config_t s_network_config = {
+    .role = RMDS_APP_NODE_ROLE,
+    .node_id = RMDS_APP_NODE_ID,
+    .gateway_node_id = RMDS_APP_GATEWAY_ID,
+    .preferred_parent_node_id = RMDS_APP_PREFERRED_PARENT_NODE_ID,
+};
 
 static uint32_t parse_hex32(const char *s)
 {
     return (uint32_t)strtoul(s, NULL, 16);
 }
 
-//Validates the CRC Check
-static bool frame_crc_ok(const sensor_frame_t *f)
+static bool frame_crc_ok(const sensor_frame_t *frame)
 {
-    return ((f->crc ^ f->crc_inv) == 0xFFFFFFFFu);
+    return (frame->crc ^ frame->crc_inv) == 0xFFFFFFFFu;
 }
 
-static bool frame_is_valid(const sensor_frame_t *f)
+static bool frame_is_valid(const sensor_frame_t *frame)
 {
-    /*if (f->start != 0x0000005B || f->end != 0x0000005D) {
-        return false;
-    }*/
-    if (!frame_crc_ok(f)) {
+    if (!frame_crc_ok(frame)) {
         ESP_LOGW(TAG_UART,
                  "CRC mismatch: crc=0x%08" PRIx32 " inv=0x%08" PRIx32,
-                 f->crc, f->crc_inv);
+                 frame->crc,
+                 frame->crc_inv);
         return false;
     }
+
     return true;
 }
 
-static void dump_frame(const sensor_frame_t *f)
+static void dump_frame(const sensor_frame_t *frame)
 {
-    float temp_K = f->temp_raw / 10.0f;
-
     ESP_LOGI(TAG_UART,
              "Frame: Conc=%" PRIu32 " ppm, Faults=%" PRIu32
              ", Temp=%.1f K, CRC=0x%08" PRIx32 ", CRC_1C=0x%08" PRIx32,
-             f->conc_ppm,
-             f->faults,
-             temp_K,
-             f->crc,
-             f->crc_inv);
+             frame->conc_ppm,
+             frame->faults,
+             frame->temp_raw / 10.0f,
+             frame->crc,
+             frame->crc_inv);
 }
 
-static void build_lora_payload_from_frame(const sensor_frame_t *f, char *out, size_t out_sz)
+static void publish_sensor_sample(const sensor_frame_t *frame)
 {
-    if (!out || out_sz == 0) return;
+    rmds_network_sensor_sample_t sample = {
+        .concentration_ppm = frame->conc_ppm,
+        .faults = frame->faults,
+        .temp_deci_kelvin = frame->temp_raw,
+        .sensor_crc = frame->crc,
+        .sensor_crc_inv = frame->crc_inv,
+        .valid = true,
+    };
 
-    float temp_K = f->temp_raw / 10.0f;
-
-    int n = snprintf(out, out_sz,
-                     "Concentration=%" PRIu32 "ppm, "
-                     "Faults=%" PRIu32 ", "
-                     "Sensor Temp=%.1fK, "
-                     "CRC=%08" PRIx32 ", "
-                     "CRC_1C=%08" PRIx32,
-                     f->conc_ppm,
-                     f->faults,
-                     temp_K,
-                     f->crc,
-                     f->crc_inv);
-
-    if (n < 0 || (size_t)n >= out_sz) {
-        ESP_LOGW(TAG_UART, "LoRa payload truncated (size=%zu)", out_sz);
+    if (!rmds_network_update_local_sample(&sample)) {
+        ESP_LOGW(TAG_UART, "Failed to publish sensor sample to network layer");
+        return;
     }
+
+    ESP_LOGI(TAG_UART,
+             "Updated network sample: conc=%" PRIu32 " faults=%" PRIu32 " temp=%.1f K",
+             sample.concentration_ppm,
+             sample.faults,
+             sample.temp_deci_kelvin / 10.0f);
 }
-//  UART RX FreeRTOS task (TX node)
+
 static void uart_rx_task(void *pvParameters)
 {
+    uint8_t rx_buf[128];
+    char line_buf[16];
+    uint32_t fields[7];
+    int line_len = 0;
+    int field_count = 0;
+
     (void)pvParameters;
 
     ESP_LOGI(TAG_UART, "UART RX task started");
 
-    uint8_t rx_buf[128];
-    char line_buf[16];          // 8 hex chars + LF + NUL
-    int line_len = 0;
-
-    uint32_t fields[7];
-    int field_count = 0;
-
     while (1) {
-        int len = uart_read_bytes(SENSOR_UART_NUM, rx_buf,
+        int len = uart_read_bytes(SENSOR_UART_NUM,
+                                  rx_buf,
                                   sizeof(rx_buf),
                                   pdMS_TO_TICKS(1000));
         if (len <= 0) {
@@ -138,71 +182,59 @@ static void uart_rx_task(void *pvParameters)
             char c = (char)rx_buf[i];
 
             if (c == '\r') {
-                continue;  // ignore CR, handle LF only
+                continue;
             }
 
             if (c == '\n') {
                 if (line_len > 0) {
                     line_buf[line_len] = '\0';
 
-                    uint32_t value = parse_hex32(line_buf);
-
                     if (field_count < 7) {
-                        fields[field_count++] = value;
+                        fields[field_count++] = parse_hex32(line_buf);
                     }
 
                     if (field_count == 7) {
-                        sensor_frame_t f = {
-                            .start    = fields[0],
+                        sensor_frame_t frame = {
+                            .start = fields[0],
                             .conc_ppm = fields[1],
-                            .faults   = fields[2],
+                            .faults = fields[2],
                             .temp_raw = fields[3],
-                            .crc      = fields[4],
-                            .crc_inv  = fields[5],
-                            .end      = fields[6],
+                            .crc = fields[4],
+                            .crc_inv = fields[5],
+                            .end = fields[6],
                         };
 
-                        if (frame_is_valid(&f)) {
-                            dump_frame(&f);
-
-                            char payload[RMDS_LORA_PAYLOAD_MAX_LEN];
-                            build_lora_payload_from_frame(&f, payload, sizeof(payload));
-                            rmds_lora_set_payload(payload);
-                            ESP_LOGI(TAG_UART, "Updated LoRa payload: %s", payload);
+                        if (frame_is_valid(&frame)) {
+                            dump_frame(&frame);
+                            publish_sensor_sample(&frame);
                         } else {
                             ESP_LOGW(TAG_UART,
-                                     "Invalid frame: start=0x%08" PRIx32
-                                     " end=0x%08" PRIx32,
-                                     f.start, f.end);
+                                     "Invalid frame: start=0x%08" PRIx32 " end=0x%08" PRIx32,
+                                     frame.start,
+                                     frame.end);
                         }
 
                         field_count = 0;
                     }
                 }
 
-                // reset line buffer after newline
                 line_len = 0;
+            } else if (line_len < (int)sizeof(line_buf) - 1) {
+                line_buf[line_len++] = c;
             } else {
-                // build current line
-                if (line_len < (int)sizeof(line_buf) - 1) {
-                    line_buf[line_len++] = c;
-                } else {
-                    // overlong line, discard and resync
-                    line_len = 0;
-                }
+                line_len = 0;
             }
         }
     }
 }
 
-//  UART initialization helper (TX node)
 static void init_uart_sensor(void)
 {
     uart_config_t uart_config = {
         .baud_rate = SENSOR_BAUD_RATE,
         .data_bits = UART_DATA_8_BITS,
-        .parity    = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_2,     // 2 stop bits
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_2,
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
         .source_clk = UART_SCLK_DEFAULT,
     };
@@ -228,27 +260,96 @@ static void init_uart_sensor(void)
              SENSOR_RX_PIN);
 }
 
+#if RMDS_APP_ENABLE_DUMMY_LOCAL_SAMPLE
+
+static void dummy_sample_task(void *pvParameters)
+{
+    uint32_t seq = 1;
+
+    (void)pvParameters;
+    ESP_LOGI(APP_TAG, "Dummy sample task started (%d ms updates)",
+             RMDS_APP_DUMMY_SAMPLE_INTERVAL_MS);
+
+    for (;;) {
+        rmds_network_sensor_sample_t sample = {
+            .concentration_ppm = 400 + (esp_random() % 100),
+            .faults = 0,
+            .temp_deci_kelvin = 2930 + (esp_random() % 50),
+            .sensor_crc = esp_random(),
+            .valid = true,
+        };
+
+        sample.sensor_crc_inv = ~sample.sensor_crc;
+
+        if (rmds_network_update_local_sample(&sample)) {
+            ESP_LOGI(APP_TAG,
+                     "Dummy sample updated: node=%u sample_seq=%" PRIu32 " conc=%" PRIu32,
+                     (unsigned int)RMDS_APP_NODE_ID,
+                     seq++,
+                     sample.concentration_ppm);
+        } else {
+            ESP_LOGW(APP_TAG, "Failed to update dummy sample");
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(RMDS_APP_DUMMY_SAMPLE_INTERVAL_MS));
+    }
+
+    vTaskDelete(NULL);
+}
+
+#endif /* RMDS_APP_ENABLE_DUMMY_LOCAL_SAMPLE */
+
 void app_main(void)
 {
     check_wake_reason();
-    
-    //USE FOR TX NODE
-    init_uart_sensor();
-    xTaskCreate(uart_rx_task,
-                "uart_rx_task",
-                4096,
-                NULL,
-                5,
-                NULL);
 
-    //rmds_lora_start_tx_only();
+    ESP_LOGI(APP_TAG,
+             "Booting role=%s node=%u gateway=%u preferred_parent=%u",
+             rmds_network_role_to_string(s_network_config.role),
+             (unsigned int)s_network_config.node_id,
+             (unsigned int)s_network_config.gateway_node_id,
+             (unsigned int)s_network_config.preferred_parent_node_id);
 
-    //enter_modem_sleep();
-    //enter_deep_sleep(10); 
+    if (s_network_config.role == RMDS_NETWORK_ROLE_GATEWAY) {
+        ESP_LOGI(APP_TAG, "Starting always-on mesh gateway");
+        rmds_wifi_init();
+    } else {
+#if RMDS_APP_ENABLE_DUMMY_LOCAL_SAMPLE
+        /*
+         * Dummy source node:
+         * leave this block enabled and leave the UART block below disabled.
+         */
+        ESP_LOGI(APP_TAG, "Starting dummy mesh source node");
+        if (xTaskCreate(dummy_sample_task,
+                        "dummy_sample_task",
+                        4096,
+                        NULL,
+                        5,
+                        NULL) != pdPASS) {
+            ESP_LOGE(APP_TAG, "Failed to create dummy sample task");
+            return;
+        }
+#else
+        /*
+         * Real sensor node:
+         * leave this UART block enabled and keep the dummy block above disabled.
+         */
+        ESP_LOGI(APP_TAG, "Starting mesh sensor node");
+        init_uart_sensor();
 
-    // USE FOR RX NODE
-    //
-    rmds_wifi_init();          // connect to Wi-Fi, only uncomment this line if master node
-    // ESP_LOGI("APP", "Starting RX-only node firmware");
-    rmds_lora_start_rx_only(); // LoRa RX + cloud forwarding is in rmds_lora.c
+        if (xTaskCreate(uart_rx_task,
+                        "uart_rx_task",
+                        4096,
+                        NULL,
+                        5,
+                        NULL) != pdPASS) {
+            ESP_LOGE(APP_TAG, "Failed to create UART RX task");
+            return;
+        }
+#endif /* RMDS_APP_ENABLE_DUMMY_LOCAL_SAMPLE */
+    }
+
+    if (!rmds_network_start(&s_network_config)) {
+        ESP_LOGE(APP_TAG, "Failed to start network layer");
+    }
 }
