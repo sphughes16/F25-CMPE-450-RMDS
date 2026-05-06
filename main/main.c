@@ -73,7 +73,7 @@
  * This only updates the local sample in the network layer.
  * Actual LoRa send timing is still controlled in rmds_network.c.
  */
-#define RMDS_APP_DUMMY_SAMPLE_INTERVAL_MS 1000
+#define RMDS_APP_DUMMY_SAMPLE_INTERVAL_MS 10000
 
 // UART configuration (UART1 on GPIO 14/25) for methane sensor nodes.
 #define SENSOR_UART_NUM   UART_NUM_1
