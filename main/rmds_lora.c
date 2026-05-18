@@ -11,6 +11,7 @@
 
 #define LORA_TAG "RMDS_LORA"
 
+/* Default LoRa radio configuration used when the caller does not supply one. */
 static const rmds_lora_config_t s_default_config = {
     .frequency_hz = 915000000L,
     .bandwidth_hz = 125000L,
@@ -24,6 +25,7 @@ static const rmds_lora_config_t s_default_config = {
 static SemaphoreHandle_t s_lora_mutex = NULL;
 static bool s_lora_initialized = false;
 
+/* Ensures the mutex for LoRa operations exists. */
 static bool rmds_lora_ensure_mutex(void)
 {
     if (s_lora_mutex != NULL) {
@@ -39,11 +41,13 @@ static bool rmds_lora_ensure_mutex(void)
     return true;
 }
 
+/* Returns a pointer to the default LoRa configuration. */
 const rmds_lora_config_t *rmds_lora_default_config(void)
 {
     return &s_default_config;
 }
 
+/* Initialize the LoRa radio using config if provided, thread-safe via mutex. */
 bool rmds_lora_init(const rmds_lora_config_t *config)
 {
     const rmds_lora_config_t *effective_config =
@@ -94,6 +98,7 @@ bool rmds_lora_init(const rmds_lora_config_t *config)
     return true;
 }
 
+/* Sends a packet over LoRa. data must be non-NULL and len within limits. */
 bool rmds_lora_send(const void *data, size_t len)
 {
     if (!s_lora_initialized || data == NULL || len == 0 || len > RMDS_LORA_MAX_PACKET_LEN) {
@@ -107,6 +112,7 @@ bool rmds_lora_send(const void *data, size_t len)
     return true;
 }
 
+/* Receives a pending LoRa packet into buf up to buf_len, returns length or 0. */
 int rmds_lora_receive(uint8_t *buf, size_t buf_len)
 {
     int len = 0;
@@ -125,6 +131,7 @@ int rmds_lora_receive(uint8_t *buf, size_t buf_len)
     return len;
 }
 
+/* Puts the LoRa radio into receive/listen mode */
 void rmds_lora_start_listening(void)
 {
     if (!s_lora_initialized) {
@@ -136,6 +143,7 @@ void rmds_lora_start_listening(void)
     xSemaphoreGive(s_lora_mutex);
 }
 
+/* Puts the LoRa radio into sleep (low-power) mode. */
 void rmds_lora_sleep_radio(void)
 {
     if (!s_lora_initialized) {
@@ -147,11 +155,13 @@ void rmds_lora_sleep_radio(void)
     xSemaphoreGive(s_lora_mutex);
 }
 
+/* Returns whether the LoRa radio has been initialized. */
 bool rmds_lora_is_initialized(void)
 {
     return s_lora_initialized;
 }
 
+/* Returns the RSSI (dBm) of the last received packet, or 0 if unavailable. */
 int rmds_lora_last_packet_rssi(void)
 {
     int rssi = 0;
@@ -166,6 +176,7 @@ int rmds_lora_last_packet_rssi(void)
     return rssi;
 }
 
+/* Returns the SNR (dB) of the last received packet, or 0.0 if unavailable. */
 float rmds_lora_last_packet_snr(void)
 {
     float snr = 0.0f;
