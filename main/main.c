@@ -23,50 +23,42 @@
 #define TAG_UART "UART_RX"
 
 /*
- * ---------------------------------------------------------------------------
- * MANUAL ROLE / NODE CONFIGURATION
- * ---------------------------------------------------------------------------
+ * MANUAL NODE ROLE CONFIGURATION
  *
- * Gateway build:
+ * Gateway:
  *   #define RMDS_APP_NODE_ROLE    RMDS_NETWORK_ROLE_GATEWAY
  *   #define RMDS_APP_NODE_ID      0
  *   #define RMDS_APP_GATEWAY_ID   0
  *
- * Mesh sensor node build:
+ *  Sensor node:
  *   #define RMDS_APP_NODE_ROLE    RMDS_NETWORK_ROLE_MESH_NODE
  *   #define RMDS_APP_NODE_ID      <nonzero node id>
  *   #define RMDS_APP_GATEWAY_ID   0
  *
- * Dummy data node build:
+ * Dummy data node:
  *   Leave the node as RMDS_NETWORK_ROLE_MESH_NODE, set the desired node ID,
  *   and enable RMDS_APP_ENABLE_DUMMY_LOCAL_SAMPLE below.
  *
  * To force a node to route through a specific parent, set
  * RMDS_APP_PREFERRED_PARENT_NODE_ID to that node ID.
  *
- * For example:
- *   - Gateway ................. node 0, role gateway
- *   - Real sensor node ........ node 1, role mesh node, preferred parent 0
- *   - Dummy source node ....... node 2, role mesh node, preferred parent 1
- *
- * Comment / uncomment only the values below for each build.
  */
 #define RMDS_APP_NODE_ROLE    RMDS_NETWORK_ROLE_MESH_NODE
 #define RMDS_APP_NODE_ID      1
 #define RMDS_APP_GATEWAY_ID   0
 
 /*
- * Dummy-sample generation is now compatible with the mesh network layer.
- * Leave this set to 1 only on the node that should generate fake sensor data.
- * Set to 0 on real sensor nodes so UART data is used instead.
+ * Currently, the local samples are set to dummy values if the node ID is not 1 or 2 for demoing purposes. 
+ * In a real deployment, either comment this section out or change both branches 
+ * to define RMDS_APP_ENABLE_DUMMY_LOCAL_SAMPLE to 0
  */
-#if RMDS_APP_NODE_ROLE == RMDS_NETWORK_ROLE_MESH_NODE && RMDS_APP_NODE_ID != 1
+#if RMDS_APP_NODE_ROLE == RMDS_NETWORK_ROLE_MESH_NODE && (RMDS_APP_NODE_ID != 1 || RMDS_APP_NODE_ID != 2)
 #define RMDS_APP_ENABLE_DUMMY_LOCAL_SAMPLE 1
 #else
 #define RMDS_APP_ENABLE_DUMMY_LOCAL_SAMPLE 0
 #endif
 
-#define RMDS_APP_PREFERRED_PARENT_NODE_ID  RMDS_NETWORK_NO_PARENT_PREFERENCE
+#define RMDS_APP_PREFERRED_PARENT_NODE_ID  RMDS_NETWORK_NO_PARENT_PREFERENCE //Leave this as RMDS_NETWORK_NO_PARENT_PREFERENCE unless you want to force a specific parent node ID for routing
 
 /*
  * Dummy sample update rate.
@@ -82,6 +74,8 @@
 #define SENSOR_BAUD_RATE  38400
 #define SENSOR_RX_BUF_SZ  2048
 
+/* Parsed sensor frame layout produced by the methane sensor over UART.
+ * Fields are parsed from hex strings into these integer slots. */
 typedef struct {
     uint32_t start;
     uint32_t conc_ppm;
@@ -92,6 +86,7 @@ typedef struct {
     uint32_t end;
 } sensor_frame_t;
 
+/* Static configuration used to start the network layer for this application. */
 static const rmds_network_config_t s_network_config = {
     .role = RMDS_APP_NODE_ROLE,
     .node_id = RMDS_APP_NODE_ID,
@@ -99,16 +94,19 @@ static const rmds_network_config_t s_network_config = {
     .preferred_parent_node_id = RMDS_APP_PREFERRED_PARENT_NODE_ID,
 };
 
+/* Parses a 32-bit value from a hexadecimal NULL-terminated string. */
 static uint32_t parse_hex32(const char *s)
 {
     return (uint32_t)strtoul(s, NULL, 16);
 }
 
+/* Checks whether the sensor frame CRC and its inverted complement match. */
 static bool frame_crc_ok(const sensor_frame_t *frame)
 {
     return (frame->crc ^ frame->crc_inv) == 0xFFFFFFFFu;
 }
 
+/* Validates a parsed sensor frame (currently validates only CRC). */
 static bool frame_is_valid(const sensor_frame_t *frame)
 {
     if (!frame_crc_ok(frame)) {
@@ -122,6 +120,7 @@ static bool frame_is_valid(const sensor_frame_t *frame)
     return true;
 }
 
+/* Logs a representation of the parsed sensor frame. */
 static void dump_frame(const sensor_frame_t *frame)
 {
     ESP_LOGI(TAG_UART,
@@ -134,6 +133,8 @@ static void dump_frame(const sensor_frame_t *frame)
              frame->crc_inv);
 }
 
+/* Converts a parsed sensor frame into the network sample format and updates
+ * the network layer's local sample store. */
 static void publish_sensor_sample(const sensor_frame_t *frame)
 {
     rmds_network_sensor_sample_t sample = {
@@ -157,6 +158,8 @@ static void publish_sensor_sample(const sensor_frame_t *frame)
              sample.temp_deci_kelvin / 10.0f);
 }
 
+/* FreeRTOS task that reads lines from the UART, parses hex fields into a
+ * sensor_frame_t, validates them, and publishes valid samples. */
 static void uart_rx_task(void *pvParameters)
 {
     uint8_t rx_buf[128];
@@ -228,6 +231,7 @@ static void uart_rx_task(void *pvParameters)
     }
 }
 
+// Configures UART parameters and installs the UART driver used for the methane sensor. 
 static void init_uart_sensor(void)
 {
     uart_config_t uart_config = {
@@ -262,6 +266,9 @@ static void init_uart_sensor(void)
 
 #if RMDS_APP_ENABLE_DUMMY_LOCAL_SAMPLE
 
+
+/* Periodically generates synthetic sensor samples for demo
+ * purposes and publishes them into the network layer. */
 static void dummy_sample_task(void *pvParameters)
 {
     uint32_t seq = 1;
@@ -297,11 +304,11 @@ static void dummy_sample_task(void *pvParameters)
     vTaskDelete(NULL);
 }
 
-#endif /* RMDS_APP_ENABLE_DUMMY_LOCAL_SAMPLE */
+#endif
 
 void app_main(void)
 {
-    check_wake_reason();
+    check_wake_reason(); //Leftover from previous implementation, does nothing
 
     ESP_LOGI(APP_TAG,
              "Booting role=%s node=%u gateway=%u preferred_parent=%u",
@@ -315,10 +322,6 @@ void app_main(void)
         rmds_wifi_init();
     } else {
 #if RMDS_APP_ENABLE_DUMMY_LOCAL_SAMPLE
-        /*
-         * Dummy source node:
-         * leave this block enabled and leave the UART block below disabled.
-         */
         ESP_LOGI(APP_TAG, "Starting dummy mesh source node");
         if (xTaskCreate(dummy_sample_task,
                         "dummy_sample_task",
@@ -330,10 +333,6 @@ void app_main(void)
             return;
         }
 #else
-        /*
-         * Real sensor node:
-         * leave this UART block enabled and keep the dummy block above disabled.
-         */
         ESP_LOGI(APP_TAG, "Starting mesh sensor node");
         init_uart_sensor();
 
@@ -346,7 +345,7 @@ void app_main(void)
             ESP_LOGE(APP_TAG, "Failed to create UART RX task");
             return;
         }
-#endif /* RMDS_APP_ENABLE_DUMMY_LOCAL_SAMPLE */
+#endif
     }
 
     if (!rmds_network_start(&s_network_config)) {

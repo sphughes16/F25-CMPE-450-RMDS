@@ -20,9 +20,9 @@
 
 #define WIFI_TAG "RMDS_WIFI"
 
+// Demo Wi-Fi credentials and cloud endpoint URL, should be replaced for deployment
 #define RMDS_WIFI_SSID "UMBC Visitor"
 #define RMDS_WIFI_PASS ""
-
 #define GOOGLE_SHEETS_URL "https://script.google.com/macros/s/AKfycbyW9pfPW8bOA1K0cMi4BbOknBrk4bzfjMWjIWcDrxjGn9i3XlunYHBt1oUDk8eg-ueJ4g/exec"
 
 #define WIFI_CONNECTED_BIT BIT0
@@ -40,6 +40,8 @@ static const int MAX_RETRY = 5;
 static bool s_wifi_ready = false;
 static bool s_wifi_stack_initialized = false;
 
+/* Handles Wi‑Fi and IP events. Triggers connect/retry and signals connection
+ * status via the event group used by the Wi‑Fi stack. */
 static void wifi_event_handler(void *arg,
                                esp_event_base_t event_base,
                                int32_t event_id,
@@ -69,6 +71,8 @@ static void wifi_event_handler(void *arg,
     }
 }
 
+/* HTTP client event handler used during cloud uploads. Logs response data
+ * and connection events for debugging. */
 static esp_err_t rmds_wifi_http_event_handler(esp_http_client_event_t *evt)
 {
     switch (evt->event_id) {
@@ -97,6 +101,8 @@ static esp_err_t rmds_wifi_http_event_handler(esp_http_client_event_t *evt)
     return ESP_OK;
 }
 
+/* Serializes frame to JSON and posts it to the configured cloud endpoint.
+ * Returns true on success. */
 static bool rmds_wifi_send_frame_to_cloud(const rmds_wifi_cloud_frame_t *frame)
 {
     char json_body[512];
@@ -177,6 +183,8 @@ static bool rmds_wifi_send_frame_to_cloud(const rmds_wifi_cloud_frame_t *frame)
     return success;
 }
 
+/* FreeRTOS task that drains the cloud queue and attempts HTTP uploads of
+ * received frames. */
 static void rmds_wifi_cloud_task(void *pvParameters)
 {
     rmds_wifi_cloud_frame_t frame;
@@ -205,6 +213,8 @@ static void rmds_wifi_cloud_task(void *pvParameters)
     }
 }
 
+/* Initializes Wi‑Fi in STA mode, connect to the configured AP, and start
+ * the cloud uploader task. This blocks until connect success or failure. */
 void rmds_wifi_init(void)
 {
     esp_err_t ret;
@@ -299,6 +309,7 @@ void rmds_wifi_init(void)
     s_wifi_stack_initialized = true;
 }
 
+/* Queues a cloud frame for upload, returns false if queue is full or NULL. */
 bool rmds_wifi_enqueue_frame(const rmds_wifi_cloud_frame_t *frame)
 {
     if (s_cloud_queue == NULL || frame == NULL) {
@@ -316,6 +327,8 @@ bool rmds_wifi_enqueue_frame(const rmds_wifi_cloud_frame_t *frame)
     return true;
 }
 
+/* Returns whether the Wi‑Fi stack is currently connected and prepared to
+ * send cloud frames. */
 bool rmds_wifi_is_ready(void)
 {
     return s_wifi_ready;

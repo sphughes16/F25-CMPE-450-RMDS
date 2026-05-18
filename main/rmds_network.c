@@ -20,25 +20,27 @@
 
 #define NETWORK_TAG "RMDS_NET"
 
-#define RMDS_NETWORK_PROTOCOL_VERSION      2U
-#define RMDS_NETWORK_BROADCAST_NODE        0xFFU
-#define RMDS_NETWORK_TASK_STACK            8192
-#define RMDS_NETWORK_POLL_MS               10
+#define RMDS_NETWORK_PROTOCOL_VERSION      2U //Protocol version for on-air packets. Nodes ignore mismatched versions.
+#define RMDS_NETWORK_BROADCAST_NODE        0xFFU //Special node ID value representing a broadcast to all nodes
+#define RMDS_NETWORK_TASK_STACK            8192 //Stack size for the network FreeRTOS task
+#define RMDS_NETWORK_POLL_MS               10 //Poll interval for checking/receiving LoRa packets.
 
-#define RMDS_NETWORK_MAX_SEEN_PACKETS      128
-#define RMDS_NETWORK_MAX_HOPS              8
-#define RMDS_NETWORK_BEACON_INTERVAL_MS    2000
-#define RMDS_NETWORK_ROUTE_STALE_MS        60000
-#define RMDS_NETWORK_FORWARD_DELAY_MS      50
-#define RMDS_NETWORK_SEND_INTERVAL_MS      10000
-#define RMDS_NETWORK_FORWARD_QUEUE_LEN     32
+#define RMDS_NETWORK_MAX_SEEN_PACKETS      128 //Number of recently seen packets to track for duplicate suppression
+#define RMDS_NETWORK_MAX_HOPS              8 //Maximum hops before a packet is considered undeliverable and dropped
+#define RMDS_NETWORK_BEACON_INTERVAL_MS    2000 //Interval for sending beacon packets
+#define RMDS_NETWORK_ROUTE_STALE_MS        60000 //Time after which a route is considered stale
+#define RMDS_NETWORK_FORWARD_DELAY_MS      50 //Delay before forwarding a packet
+#define RMDS_NETWORK_SEND_INTERVAL_MS      10000 //Interval for sending data packets
+#define RMDS_NETWORK_FORWARD_QUEUE_LEN     32 //Maximum number of data packets that can be queued for forwarding
 
+/* Packet types used on the air: beacons, data, and acknowledgements. */
 typedef enum {
     RMDS_NETWORK_PKT_BEACON = 1,
     RMDS_NETWORK_PKT_DATA   = 2,
     RMDS_NETWORK_PKT_ACK    = 3,
 } rmds_network_packet_type_t;
 
+/* Common header present at the start of every packet. */
 typedef struct __attribute__((packed)) {
     uint8_t version;
     uint8_t type;
@@ -51,11 +53,13 @@ typedef struct __attribute__((packed)) {
     uint32_t sequence;
 } rmds_network_header_t;
 
+/* Beacon packet used to advertise routing information. */
 typedef struct __attribute__((packed)) {
     rmds_network_header_t header;
     uint8_t route_cost;
 } rmds_network_beacon_packet_t;
 
+/* Data packet that carries a sensor sample and CRC data. */
 typedef struct __attribute__((packed)) {
     rmds_network_header_t header;
     uint32_t concentration_ppm;
@@ -65,10 +69,13 @@ typedef struct __attribute__((packed)) {
     uint32_t sensor_crc_inv;
 } rmds_network_data_packet_t;
 
+/* Acknowledgement packet containing only the common header. */
 typedef struct __attribute__((packed)) {
     rmds_network_header_t header;
 } rmds_network_ack_packet_t;
 
+/* Cached route information for the best-known parent. Contains validity, parent
+ * node id, computed route cost, last-seen RSSI, and last update time. */
 typedef struct {
     bool valid;
     uint8_t parent_node_id;
@@ -77,6 +84,8 @@ typedef struct {
     int64_t last_update_ms;
 } rmds_network_route_t;
 
+/* Record of recently-seen origin+sequence pairs to prevent duplicate
+ * processing/forwarding. */
 typedef struct {
     bool used;
     uint8_t origin_node_id;
@@ -106,6 +115,7 @@ static size_t s_forward_queue_count = 0;
 
 RTC_DATA_ATTR static uint32_t s_next_sequence = 1;
 
+/* Ensures the mutex protecting the latest sensor sample exists */
 static bool rmds_network_ensure_sample_mutex(void)
 {
     if (s_sample_mutex != NULL) {
@@ -122,11 +132,13 @@ static bool rmds_network_ensure_sample_mutex(void)
     return true;
 }
 
+/* Returns the current time in milliseconds */
 static int64_t rmds_network_now_ms(void)
 {
     return esp_timer_get_time() / 1000;
 }
 
+/* Safely copies the latest local sensor sample into sample */
 static bool rmds_network_copy_latest_sample(rmds_network_sensor_sample_t *sample)
 {
     if (sample == NULL || !rmds_network_ensure_sample_mutex()) {
@@ -139,6 +151,7 @@ static bool rmds_network_copy_latest_sample(rmds_network_sensor_sample_t *sample
     return sample->valid;
 }
 
+/* Populates a packet header structure with the provided fields. */
 static void rmds_network_fill_header(rmds_network_header_t *header,
                                      rmds_network_packet_type_t type,
                                      uint8_t origin_node_id,
@@ -160,6 +173,8 @@ static void rmds_network_fill_header(rmds_network_header_t *header,
     header->sequence = sequence;
 }
 
+/* Attempts to parse a rmds_network_header_t from buf if length permits
+ * and protocol version matches. */
 static bool rmds_network_try_get_header(const uint8_t *buf,
                                         size_t len,
                                         rmds_network_header_t *header)
@@ -176,6 +191,8 @@ static bool rmds_network_try_get_header(const uint8_t *buf,
     return true;
 }
 
+/* Polls for a LoRa packet until deadline_ms. If a packet is received,
+ * optionally stores its length in packet_len and returns true. */
 static bool rmds_network_wait_for_packet(uint8_t *buf,
                                          size_t buf_len,
                                          int64_t deadline_ms,
@@ -199,6 +216,7 @@ static bool rmds_network_wait_for_packet(uint8_t *buf,
     return false;
 }
 
+/* Expires old entries from the seen-packet cache to limit memory usage. */
 static void rmds_network_seen_expire_old(void)
 {
     int64_t now_ms = rmds_network_now_ms();
@@ -211,6 +229,7 @@ static void rmds_network_seen_expire_old(void)
     }
 }
 
+/* Checks whether we've already seen the given origin+sequence pair. */
 static bool rmds_network_seen_contains(uint8_t origin_node_id, uint32_t sequence)
 {
     size_t i;
@@ -226,6 +245,7 @@ static bool rmds_network_seen_contains(uint8_t origin_node_id, uint32_t sequence
     return false;
 }
 
+/* Records that we've seen the origin+sequence pair, replacing the oldest entry if needed. */
 static void rmds_network_seen_add(uint8_t origin_node_id, uint32_t sequence)
 {
     size_t i;
@@ -253,6 +273,7 @@ static void rmds_network_seen_add(uint8_t origin_node_id, uint32_t sequence)
     s_seen[replace_index].seen_at_ms = rmds_network_now_ms();
 }
 
+/* Returns true if the cached route is still considered fresh. */
 static bool rmds_network_have_fresh_route(void)
 {
     if (!s_route.valid) {
@@ -262,6 +283,8 @@ static bool rmds_network_have_fresh_route(void)
     return (rmds_network_now_ms() - s_route.last_update_ms) <= RMDS_NETWORK_ROUTE_STALE_MS;
 }
 
+/* Considers parent_node_id as a candidate route, updates cached route if
+ * it is better or matches preferred criteria. */
 static void rmds_network_maybe_update_route(uint8_t parent_node_id,
                                             uint8_t route_cost,
                                             int rssi_dbm)
@@ -312,6 +335,7 @@ static void rmds_network_maybe_update_route(uint8_t parent_node_id,
     }
 }
 
+/* Builds and transmits a beacon packet advertising this node's route cost. */
 static bool rmds_network_send_beacon(void)
 {
     rmds_network_beacon_packet_t pkt;
@@ -337,6 +361,7 @@ static bool rmds_network_send_beacon(void)
     return rmds_lora_send(&pkt, sizeof(pkt));
 }
 
+/* Sends an ACK packet for sequence back to dest_node_id (for origin). */
 static bool rmds_network_send_ack(uint8_t origin_node_id,
                                   uint8_t dest_node_id,
                                   uint32_t sequence)
@@ -356,6 +381,7 @@ static bool rmds_network_send_ack(uint8_t origin_node_id,
     return rmds_lora_send(&pkt, sizeof(pkt));
 }
 
+/* Reads the latest local sample and broadcasts it as a data packet. */
 static bool rmds_network_send_local_data(void)
 {
     rmds_network_sensor_sample_t sample;
@@ -385,7 +411,7 @@ static bool rmds_network_send_local_data(void)
     pkt.sensor_crc = sample.sensor_crc;
     pkt.sensor_crc_inv = sample.sensor_crc_inv;
 
-    /* Mark our own packet as seen so we do not forward it back if we hear it later. */
+    /* Marks our own packet as seen so we do not forward it back if we hear it later. */
     rmds_network_seen_expire_old();
     rmds_network_seen_add(pkt.header.origin_node_id, pkt.header.sequence);
 
@@ -398,6 +424,8 @@ static bool rmds_network_send_local_data(void)
     return rmds_lora_send(&pkt, sizeof(pkt));
 }
 
+/* Forwards an incoming data packet after updating sender/hop fields and
+ * applying a randomized delay. */
 static bool rmds_network_forward_data(const rmds_network_data_packet_t *incoming)
 {
     rmds_network_data_packet_t pkt;
@@ -432,6 +460,7 @@ static bool rmds_network_forward_data(const rmds_network_data_packet_t *incoming
     return rmds_lora_send(&pkt, sizeof(pkt));
 }
 
+/* Enqueues pkt for later forwarding, returns false if queue is full. */
 static bool rmds_network_forward_queue_push(const rmds_network_data_packet_t *pkt)
 {
     if (pkt == NULL) {
@@ -452,6 +481,7 @@ static bool rmds_network_forward_queue_push(const rmds_network_data_packet_t *pk
     return true;
 }
 
+/* Peeks at the next packet waiting in the forward queue without removing it. */
 static bool rmds_network_forward_queue_peek(rmds_network_data_packet_t *pkt)
 {
     if (pkt == NULL || s_forward_queue_count == 0) {
@@ -462,6 +492,7 @@ static bool rmds_network_forward_queue_peek(rmds_network_data_packet_t *pkt)
     return true;
 }
 
+/* Pops the head item from the forward queue. */
 static void rmds_network_forward_queue_pop(void)
 {
     if (s_forward_queue_count == 0) {
@@ -472,6 +503,8 @@ static void rmds_network_forward_queue_pop(void)
     s_forward_queue_count--;
 }
 
+/* Converts a received data packet into a rmds_wifi_cloud_frame_t and
+ * enqueues it for cloud upload (gateway only). */
 static void rmds_network_gateway_consume_data(const rmds_network_data_packet_t *pkt,
                                               int rssi_dbm,
                                               float snr_db)
@@ -504,6 +537,7 @@ static void rmds_network_gateway_consume_data(const rmds_network_data_packet_t *
     }
 }
 
+/* Processes an incoming beacon packet and possibly update routing state. */
 static void rmds_network_handle_beacon(const rmds_network_beacon_packet_t *pkt)
 {
     uint8_t advertised_cost;
@@ -541,6 +575,8 @@ static void rmds_network_handle_beacon(const rmds_network_beacon_packet_t *pkt)
                                     rmds_lora_last_packet_rssi());
 }
 
+/* Handles an incoming data packet. Deduplicate & consume at gateway or enqueue
+ * for forwarding by mesh nodes. */
 static void rmds_network_handle_data(const rmds_network_data_packet_t *pkt)
 {
     bool duplicate;
@@ -600,6 +636,7 @@ static void rmds_network_handle_data(const rmds_network_data_packet_t *pkt)
     rmds_lora_start_listening();
 }
 
+/* Handle an incoming ACK packet intended for this node. */
 static void rmds_network_handle_ack(const rmds_network_ack_packet_t *pkt)
 {
     if (pkt == NULL) {
@@ -616,6 +653,7 @@ static void rmds_network_handle_ack(const rmds_network_ack_packet_t *pkt)
              pkt->header.sequence);
 }
 
+/* Polls for and processes a single incoming packet */
 static void rmds_network_process_incoming_once(int64_t deadline_ms)
 {
     uint8_t rx_buf[RMDS_LORA_MAX_PACKET_LEN];
@@ -660,6 +698,8 @@ static void rmds_network_process_incoming_once(int64_t deadline_ms)
     }
 }
 
+/* Decides whether to send local data or forward queued packets based on
+ * current policy and availability. */
 static void rmds_network_service_tx(void)
 {
     bool local_available;
@@ -708,6 +748,8 @@ static void rmds_network_service_tx(void)
     }
 }
 
+/* Main mesh task. Initializes radio, maintains beacons, schedules local sends,
+ * and processes incoming traffic */
 static void rmds_network_mesh_task(void *pvParameters)
 {
     int64_t next_beacon_ms;
@@ -769,6 +811,7 @@ static void rmds_network_mesh_task(void *pvParameters)
     }
 }
 
+/* Creates and starts the mesh network task using config */
 bool rmds_network_start(const rmds_network_config_t *config)
 {
     if (config == NULL || s_network_started) {
@@ -806,6 +849,7 @@ bool rmds_network_start(const rmds_network_config_t *config)
     return true;
 }
 
+/* Updates the atomically protected local sensor sample used when sending local broadcasts */
 bool rmds_network_update_local_sample(const rmds_network_sensor_sample_t *sample)
 {
     if (sample == NULL || !rmds_network_ensure_sample_mutex()) {
@@ -818,6 +862,7 @@ bool rmds_network_update_local_sample(const rmds_network_sensor_sample_t *sample
     return true;
 }
 
+/* Returns a string for the given role enum. */
 const char *rmds_network_role_to_string(rmds_network_role_t role)
 {
     switch (role) {
