@@ -1,3 +1,4 @@
+/* Power management functions for the ESP32, unused & largely untested in our implementation */
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_sleep.h"
@@ -8,12 +9,10 @@ static const char *TAG = "POWER";
 // Save data across sleep
 RTC_DATA_ATTR uint32_t boot_count = 0;
 
-// Your LoRa pins
+// LoRa pins
 #define LORA_DIO0_PIN  GPIO_NUM_26  // Wake pin (must be RTC-capable)
 
-// ================================================================
-// 1. MODEM SLEEP - CPU on, WiFi/BT off (20-25 mA)
-// ================================================================
+// MODEM SLEEP - CPU on, WiFi/BT off (20-25 mA)
 void enter_modem_sleep(void)
 {
     // Turn off WiFi and Bluetooth
@@ -31,9 +30,7 @@ void enter_modem_sleep(void)
     ESP_LOGI(TAG, "Modem sleep: 20-25 mA");
 }
 
-// ================================================================
-// 2. DEEP SLEEP - Everything off (~10 µA)
-// ================================================================
+// DEEP SLEEP - Everything off (~10 µA)
 void enter_deep_sleep(uint64_t seconds)
 {
     boot_count++;
@@ -48,9 +45,7 @@ void enter_deep_sleep(uint64_t seconds)
     esp_deep_sleep_start();
 }
 
-// ================================================================
-// 3. HIBERNATION - Maximum savings (10 µA)
-// ================================================================
+// HIBERNATION - Maximum savings (10 µA)
 void enter_hibernation(uint64_t seconds)
 {
     // Only timer wake
@@ -63,9 +58,7 @@ void enter_hibernation(uint64_t seconds)
     esp_deep_sleep_start();
 }
 
-// ================================================================
 // Check why we woke up
-// ================================================================
 void check_wake_reason(void)
 {
     switch(esp_sleep_get_wakeup_cause()) {
