@@ -7,6 +7,8 @@ extern "C" {
 #include <stdbool.h>
 #include <stdint.h>
 
+/* Frame representing a sensor reading and metadata sent from the gateway
+ * to the cloud upload task. */
 typedef struct {
     uint8_t node_id;
     uint32_t network_seq;
@@ -20,15 +22,16 @@ typedef struct {
 } rmds_wifi_cloud_frame_t;
 
 /**
- * Initialize Wi-Fi in STA mode and connect to the configured AP.
+ * Initializes Wi-Fi in STA mode and connect to the configured AP.
  * This function blocks until connected or a failure occurs.
  */
 void rmds_wifi_init(void);
 
 /**
- * Queue a single received network frame for cloud upload.
+ * Queues a single received network frame for cloud upload.
  */
 bool rmds_wifi_enqueue_frame(const rmds_wifi_cloud_frame_t *frame);
+/* Returns true if the Wi‑Fi stack is connected and ready to upload frames. */
 bool rmds_wifi_is_ready(void);
 
 #ifdef __cplusplus

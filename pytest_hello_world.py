@@ -1,3 +1,5 @@
+# Default test file included in the IDF template, unused in this project
+
 # SPDX-FileCopyrightText: 2022-2025 Espressif Systems (Shanghai) CO LTD
 # SPDX-License-Identifier: CC0-1.0
 import hashlib
